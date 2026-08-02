@@ -12,3 +12,7 @@ CLAUDE.md
 AGENTS.md
 .agents/
 acl.yaml
+
+# Local agent design artifacts
+/docs/superpowers/
+/.superpowers/
