@@ -257,26 +257,30 @@ dependencies = [
 
 [[package]]
 name = "buffa"
-version = "0.3.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df3fea50199859017c80584fef221c61abb882c69ed5b6e30a0bf75864e3c505"
+checksum = "33f29a40702df4b86ccd84211bfde8cee0bce6d0811450ade4a86a7d0958a23a"
 dependencies = [
  "base64",
  "bytes",
+ "foldhash 0.1.5",
  "hashbrown 0.15.5",
  "once_cell",
+ "rustversion",
  "serde",
  "serde_json",
+ "smoothutf8",
  "thiserror",
 ]
 
 [[package]]
 name = "buffa-types"
-version = "0.3.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4d80c9929af9fcc673653b99f81c1d13aa32c2bb329bb1ef02ec533994389c6"
+checksum = "22cb54bcbf6946c58e550eeaf6209047146363dbc7cbdc87e49e67089ed2ff5f"
 dependencies = [
  "buffa",
+ "bytes",
  "serde",
  "serde_json",
  "thiserror",
@@ -451,7 +455,7 @@ dependencies = [
 [[package]]
 name = "connect-rust-h3"
 version = "0.2.0"
-source = "git+https://github.com/xflash-panda/connect-rust-h3?tag=v0.2.0#4a7abf980a6412619e5a9ad7a4627fbc8830f015"
+source = "git+https://github.com/private-land/connect-rust-h3?tag=v0.2.0#4a7abf980a6412619e5a9ad7a4627fbc8830f015"
 dependencies = [
  "bytes",
  "futures",
@@ -470,11 +474,12 @@ dependencies = [
 
 [[package]]
 name = "connectrpc"
-version = "0.3.3"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e9191b8c90cfc0d27f3df209ea83fa1cb1f9b7e81480bc9d89661be41350778"
+checksum = "e4d1bbfc95ed1f4f31a027f5b97ff981be2617bc8a5c800fd6fcc701867bb97f"
 dependencies = [
  "async-compression",
+ "async-trait",
  "base64",
  "buffa",
  "bytes",
@@ -494,6 +499,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "wasm-bindgen-futures",
  "zstd",
 ]
 
@@ -768,6 +774,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1598,8 +1605,8 @@ dependencies = [
 
 [[package]]
 name = "panel-connect-rpc"
-version = "0.1.13"
-source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.13#194154e0b121a5ce0d8b5fbf42dd0ce105986939"
+version = "0.1.18"
+source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.18#29e118a94c84a9c5486b082e7bd2d507359133df"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1617,8 +1624,8 @@ dependencies = [
 
 [[package]]
 name = "panel-core"
-version = "0.1.11"
-source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.13#194154e0b121a5ce0d8b5fbf42dd0ce105986939"
+version = "0.1.18"
+source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.18#29e118a94c84a9c5486b082e7bd2d507359133df"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2277,8 +2284,8 @@ dependencies = [
 
 [[package]]
 name = "server-agent-proto-rs"
-version = "0.3.1"
-source = "git+https://github.com/xflash-panda/server-agent-proto-rs.git?tag=v0.3.1#e3a60cada3f4ab1d0d148a614a06587509fa0c52"
+version = "0.4.0"
+source = "git+https://github.com/private-land/server-agent-proto-rs.git?tag=v0.4.0#5b931f3c2b78983d8dc6ceaf64c91f6ce3f63e97"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -2332,8 +2339,8 @@ dependencies = [
 
 [[package]]
 name = "server-client-rs"
-version = "0.1.15"
-source = "git+https://github.com/xflash-panda/server-client-rs.git?tag=v0.1.15#9fe614447078d7764debb0ad9afbc58bd4c377f9"
+version = "0.1.18"
+source = "git+https://github.com/private-land/server-client-rs.git?tag=v0.1.18#8d867e6b94a52be9e68ba0f711dc6f5f6d883d80"
 dependencies = [
  "reqwest",
  "serde",
@@ -2387,6 +2394,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2397,6 +2410,15 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "smoothutf8"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36358427d32ecdb1624616deed99eccfef0a167fe5bf40ddb51efe6980bc1ec8"
+dependencies = [
+ "simdutf8",
+]
 
 [[package]]
 name = "socket2"
@@ -3466,6 +3488,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
 
 [[package]]
 name = "zmij"
