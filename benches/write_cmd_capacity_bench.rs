@@ -34,8 +34,8 @@ async fn run_multi_stream_download(write_cmd_capacity: usize) {
     let (mut client_io, server_io) = tokio::io::duplex(4 * 1024 * 1024);
     let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
     let config = SessionConfig {
-        max_streams: 256,
         write_cmd_capacity,
+        ..SessionConfig::default()
     };
     let session = Arc::new(Session::new_server(server_io, padding, config));
 
@@ -50,7 +50,7 @@ async fn run_multi_stream_download(write_cmd_capacity: usize) {
     let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(16);
     let sess = session.clone();
     let recv_handle = tokio::spawn(async move {
-        sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+        sess.recv_loop(new_stream_tx, CancellationToken::new())
             .await
     });
 
