@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "acl-engine-rs"
-version = "0.4.4"
-source = "git+https://github.com/private-land/acl-engine-rs.git?tag=v0.4.4#411b0893b75e1da88a7eb853400810d260a1d5f1"
+version = "0.4.5"
+source = "git+https://github.com/private-land/acl-engine-rs.git?tag=v0.4.5#e8202ff4f4f2a9660321f5afdf71a89aeeae0859"
 dependencies = [
  "async-trait",
  "base64",
@@ -601,8 +601,8 @@ dependencies = [
 
 [[package]]
 name = "dns-cache-rs"
-version = "0.2.0"
-source = "git+https://github.com/private-land/dns-cache-rs.git?tag=v0.2.0#8e4545210ca5ac48ab659cebcf52e921e87520a3"
+version = "0.2.1"
+source = "git+https://github.com/private-land/dns-cache-rs.git?tag=v0.2.1#82a97d0f07a4e13fda002c865a6f6a439ca6bca0"
 dependencies = [
  "async-trait",
  "moka",
@@ -839,20 +839,14 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.16.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
 ]
-
-[[package]]
-name = "hashbrown"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 
 [[package]]
 name = "heck"
@@ -1232,11 +1226,11 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
 ]
 
 [[package]]
@@ -1247,9 +1241,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "maxminddb"
-version = "0.27.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76371bd37ce742f8954daabd0fde7f1594ee43ac2200e20c003ba5c3d65e2192"
+checksum = "65e84ef32bcbf18a95548989e880db4af6fafd563463753afb4b9a149fb2782c"
 dependencies = [
  "ipnetwork",
  "log",
@@ -1422,8 +1416,8 @@ dependencies = [
 
 [[package]]
 name = "panel-core"
-version = "0.1.18"
-source = "git+https://github.com/private-land/server-panel-rs.git?tag=v0.1.18#29e118a94c84a9c5486b082e7bd2d507359133df"
+version = "0.1.19"
+source = "git+https://github.com/private-land/server-panel-rs.git?tag=v0.1.19#fa01351aa6ae02d4f738a4a3cf8f792b5c69ed85"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1438,8 +1432,8 @@ dependencies = [
 
 [[package]]
 name = "panel-http"
-version = "0.1.18"
-source = "git+https://github.com/private-land/server-panel-rs.git?tag=v0.1.18#29e118a94c84a9c5486b082e7bd2d507359133df"
+version = "0.1.19"
+source = "git+https://github.com/private-land/server-panel-rs.git?tag=v0.1.19#fa01351aa6ae02d4f738a4a3cf8f792b5c69ed85"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1999,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "server-anytls-rs"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
