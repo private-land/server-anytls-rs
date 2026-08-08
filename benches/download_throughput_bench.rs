@@ -104,7 +104,7 @@ fn bench_download_throughput(c: &mut Criterion) {
                         let cancel = CancellationToken::new();
                         let cancel2 = cancel.clone();
                         let recv_handle = tokio::spawn(async move {
-                            sess.recv_loop(new_stream_tx, None, None, cancel2).await
+                            sess.recv_loop(new_stream_tx, cancel2).await
                         });
 
                         let stream = new_stream_rx.recv().await.unwrap();
