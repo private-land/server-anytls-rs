@@ -55,7 +55,7 @@ fn bench_channel_pressure(c: &mut Criterion) {
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
                 let sess = session.clone();
                 let recv_handle = tokio::spawn(async move {
-                    sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                    sess.recv_loop(new_stream_tx, CancellationToken::new())
                         .await
                 });
 

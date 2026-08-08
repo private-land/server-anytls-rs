@@ -5,6 +5,12 @@ docs/
 # Claude
 CLAUDE.md
 .claude/
+
+# Codex local configuration and agent artifacts must not be committed.
+.codex/
+.codex-log/
+AGENTS.md
+.agents/
 acl.yaml
 
 # Local agent design artifacts

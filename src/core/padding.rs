@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use md5::{Digest, Md5};
-use rand::Rng;
+use rand::RngExt;
 
 pub const CHECK_MARK: i32 = -1;
 

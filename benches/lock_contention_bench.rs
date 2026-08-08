@@ -47,15 +47,15 @@ fn bench_send_fin_idle(c: &mut Criterion) {
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(256);
                 let sess = session.clone();
                 let recv_handle = tokio::spawn(async move {
-                    sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                    sess.recv_loop(new_stream_tx, CancellationToken::new())
                         .await
                 });
 
                 // Create 10 streams and immediately send FIN
                 for stream_id in 1..=10u32 {
                     write_frame(&mut client_io, Command::Syn, stream_id, &[]).await;
-                    let _stream = new_stream_rx.recv().await.unwrap();
-                    session.send_fin(stream_id).await.unwrap();
+                    let stream = new_stream_rx.recv().await.unwrap();
+                    stream.send_fin().await.unwrap();
                 }
 
                 recv_handle.abort();
@@ -86,7 +86,7 @@ fn bench_send_fin_under_load(c: &mut Criterion) {
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(256);
                 let sess = session.clone();
                 let recv_handle = tokio::spawn(async move {
-                    sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                    sess.recv_loop(new_stream_tx, CancellationToken::new())
                         .await
                 });
 
@@ -108,8 +108,8 @@ fn bench_send_fin_under_load(c: &mut Criterion) {
                 // While data is flowing, send FIN for new streams
                 for stream_id in 2..=10u32 {
                     write_frame(&mut client_io, Command::Syn, stream_id, &[]).await;
-                    let _stream = new_stream_rx.recv().await.unwrap();
-                    session.send_fin(stream_id).await.unwrap();
+                    let stream = new_stream_rx.recv().await.unwrap();
+                    stream.send_fin().await.unwrap();
                 }
 
                 let _ = writer_handle.await;
