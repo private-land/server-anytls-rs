@@ -1422,8 +1422,8 @@ dependencies = [
 
 [[package]]
 name = "panel-core"
-version = "0.1.11"
-source = "git+https://github.com/private-land/server-panel-rs.git?tag=v0.1.13#194154e0b121a5ce0d8b5fbf42dd0ce105986939"
+version = "0.1.18"
+source = "git+https://github.com/private-land/server-panel-rs.git?tag=v0.1.18#29e118a94c84a9c5486b082e7bd2d507359133df"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1438,8 +1438,8 @@ dependencies = [
 
 [[package]]
 name = "panel-http"
-version = "0.1.11"
-source = "git+https://github.com/private-land/server-panel-rs.git?tag=v0.1.13#194154e0b121a5ce0d8b5fbf42dd0ce105986939"
+version = "0.1.18"
+source = "git+https://github.com/private-land/server-panel-rs.git?tag=v0.1.18#29e118a94c84a9c5486b082e7bd2d507359133df"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2040,8 +2040,8 @@ dependencies = [
 
 [[package]]
 name = "server-client-rs"
-version = "0.1.15"
-source = "git+https://github.com/xflash-panda/server-client-rs.git?tag=v0.1.15#9fe614447078d7764debb0ad9afbc58bd4c377f9"
+version = "0.1.18"
+source = "git+https://github.com/private-land/server-client-rs.git?tag=v0.1.18#8d867e6b94a52be9e68ba0f711dc6f5f6d883d80"
 dependencies = [
  "reqwest",
  "serde",
