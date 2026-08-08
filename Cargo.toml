@@ -13,9 +13,9 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 rustls-pemfile = "2"
 bytes = "1"
-sha2 = "0.10"
-md-5 = "0.10"
-rand = "0.9"
+sha2 = "0.11"
+md-5 = "0.11"
+rand = "0.10"
 tracing = "0.1"
 thiserror = "2"
 tokio-util = "0.7"
@@ -44,7 +44,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 rcgen = "0.14.7"
 tempfile = "3"
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
