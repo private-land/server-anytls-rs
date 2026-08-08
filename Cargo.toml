@@ -15,7 +15,7 @@ rustls-pemfile = "2"
 bytes = "1"
 sha2 = "0.10"
 md-5 = "0.10"
-rand = "0.9"
+rand = "0.10"
 tracing = "0.1"
 thiserror = "2"
 tokio-util = "0.7"
@@ -33,8 +33,8 @@ serde_yaml = "0.9"
 humantime = "2"
 tracing-subscriber = { version = "0.3", features = ["time", "local-time"] }
 time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
-panel-core = { git = "https://github.com/private-land/server-panel-rs.git", tag = "v0.1.9" }
-panel-http = { git = "https://github.com/private-land/server-panel-rs.git", tag = "v0.1.9" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs.git", tag = "v0.1.13" }
+panel-http = { git = "https://github.com/private-land/server-panel-rs.git", tag = "v0.1.13" }
 acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0" }
 socket2 = "0.6"
@@ -42,7 +42,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 rcgen = "0.14.7"
 tempfile = "3"
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
