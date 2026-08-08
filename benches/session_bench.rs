@@ -23,7 +23,7 @@ fn bench_session_throughput(c: &mut Criterion) {
                 write_frame(&mut client_io, Command::Settings, 0, settings.as_bytes()).await;
                 let sess = session.clone();
                 let handle = tokio::spawn(async move {
-                    sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                    sess.recv_loop(new_stream_tx, CancellationToken::new())
                         .await
                 });
                 write_frame(&mut client_io, Command::Syn, 1, &[]).await;

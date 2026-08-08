@@ -4,6 +4,7 @@
 //! allocates via Bytes::copy_from_slice on every call.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use server_anytls_rs::core::session::DEFAULT_STREAM_CHANNEL_CAPACITY;
 use server_anytls_rs::core::stream::{Stream, WriteCommand};
 use tokio::io::AsyncWriteExt;
 
@@ -22,7 +23,8 @@ fn bench_stream_write(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let (session_tx, mut session_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
-                let (_data_tx, mut stream) = Stream::new(1, session_tx);
+                let (_data_tx, mut stream) =
+                    Stream::new(1, session_tx, DEFAULT_STREAM_CHANNEL_CAPACITY);
 
                 // Drain the channel in a background task
                 let drain = tokio::spawn(async move { while session_rx.recv().await.is_some() {} });
