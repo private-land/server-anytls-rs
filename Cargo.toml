@@ -33,12 +33,12 @@ serde_yaml = "0.9"
 humantime = "2"
 tracing-subscriber = { version = "0.3", features = ["time", "local-time"] }
 time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
-acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
-dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0" }
+acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag = "v0.4.5", features = ["async"] }
+dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1" }
 
 # Panel Integration (connect-rpc via QUIC/H3)
-panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.18" }
-panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.18" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
+panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
 socket2 = "0.6"
 libc = "0.2"
 
@@ -47,7 +47,7 @@ tokio-test = "0.4"
 criterion = { version = "0.8", features = ["async_tokio"] }
 rcgen = "0.14.7"
 tempfile = "3"
-dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
+dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1", features = ["test-utils"] }
 
 [[bench]]
 name = "frame_bench"
