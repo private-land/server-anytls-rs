@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acl-engine-rs"
 version = "0.4.4"
-source = "git+https://github.com/xflash-panda/acl-engine-rs.git?tag=v0.4.4#411b0893b75e1da88a7eb853400810d260a1d5f1"
+source = "git+https://github.com/private-land/acl-engine-rs.git?tag=v0.4.4#411b0893b75e1da88a7eb853400810d260a1d5f1"
 dependencies = [
  "async-trait",
  "base64",
@@ -710,7 +710,7 @@ dependencies = [
 [[package]]
 name = "dns-cache-rs"
 version = "0.2.0"
-source = "git+https://github.com/xflash-panda/dns-cache-rs.git?tag=v0.2.0#8e4545210ca5ac48ab659cebcf52e921e87520a3"
+source = "git+https://github.com/private-land/dns-cache-rs.git?tag=v0.2.0#8e4545210ca5ac48ab659cebcf52e921e87520a3"
 dependencies = [
  "async-trait",
  "moka",
@@ -1635,7 +1635,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 [[package]]
 name = "panel-connect-rpc"
 version = "0.1.13"
-source = "git+https://github.com/xflash-panda/server-panel-rs?tag=v0.1.13#194154e0b121a5ce0d8b5fbf42dd0ce105986939"
+source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.13#194154e0b121a5ce0d8b5fbf42dd0ce105986939"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1654,7 +1654,7 @@ dependencies = [
 [[package]]
 name = "panel-core"
 version = "0.1.11"
-source = "git+https://github.com/xflash-panda/server-panel-rs?tag=v0.1.13#194154e0b121a5ce0d8b5fbf42dd0ce105986939"
+source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.13#194154e0b121a5ce0d8b5fbf42dd0ce105986939"
 dependencies = [
  "anyhow",
  "arc-swap",
