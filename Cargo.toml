@@ -1,6 +1,6 @@
 [package]
 name = "server-anytls-rs"
-version = "0.1.42"
+version = "0.1.43"
 edition = "2024"
 
 [[bin]]
@@ -37,8 +37,8 @@ acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1" }
 
 # Panel Integration (connect-rpc via QUIC/H3)
-panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
-panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.19" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.20" }
+panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", tag = "v0.1.20" }
 socket2 = "0.6"
 libc = "0.2"
 
