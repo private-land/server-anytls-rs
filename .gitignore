@@ -16,3 +16,4 @@ acl.yaml
 # Local agent design artifacts
 /docs/superpowers/
 /.superpowers/
+web-key.txt
