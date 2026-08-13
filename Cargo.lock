@@ -1557,8 +1557,8 @@ dependencies = [
 
 [[package]]
 name = "panel-connect-rpc"
-version = "0.1.19"
-source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.19#fa01351aa6ae02d4f738a4a3cf8f792b5c69ed85"
+version = "0.1.20"
+source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.20#66c93f72f1c6ccfa7b72bb18df60edf5f64646c6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1576,8 +1576,8 @@ dependencies = [
 
 [[package]]
 name = "panel-core"
-version = "0.1.19"
-source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.19#fa01351aa6ae02d4f738a4a3cf8f792b5c69ed85"
+version = "0.1.20"
+source = "git+https://github.com/private-land/server-panel-rs?tag=v0.1.20#66c93f72f1c6ccfa7b72bb18df60edf5f64646c6"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2186,8 +2186,8 @@ dependencies = [
 
 [[package]]
 name = "server-agent-proto-rs"
-version = "0.4.1"
-source = "git+https://github.com/private-land/server-agent-proto-rs.git?tag=v0.4.1#ca36cf8b76b34d15b0c167c914ffe42b65eda131"
+version = "0.4.2"
+source = "git+https://github.com/private-land/server-agent-proto-rs.git?tag=v0.4.2#e6c65f31c7ef7c75c41c4672b003758f00b674f0"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "server-anytls-rs"
-version = "0.1.42"
+version = "0.1.43"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
@@ -2241,8 +2241,8 @@ dependencies = [
 
 [[package]]
 name = "server-client-rs"
-version = "0.1.18"
-source = "git+https://github.com/private-land/server-client-rs.git?tag=v0.1.18#8d867e6b94a52be9e68ba0f711dc6f5f6d883d80"
+version = "0.1.19"
+source = "git+https://github.com/private-land/server-client-rs.git?tag=v0.1.19#4372e20d7f25d6ec4fd03afbdcf3480b5eb9f829"
 dependencies = [
  "reqwest",
  "serde",
