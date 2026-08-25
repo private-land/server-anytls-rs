@@ -116,7 +116,12 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_streams: 256,
-            write_cmd_capacity: 512,
+            // Per-session writer queue depth. Bounds how much target->client
+            // data one session can buffer before backpressure: write_cmd_capacity
+            // frames of up to u16::MAX bytes. Kept small (64 -> ~4 MB ceiling) so
+            // a bulk download cannot balloon a session to tens of MB and OOM a
+            // small node. See PER_SESSION_KB in config_auto.rs (kept consistent).
+            write_cmd_capacity: 64,
             write_buf_size: DEFAULT_WRITE_BUF_SIZE,
             stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
         }
