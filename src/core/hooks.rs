@@ -76,8 +76,16 @@ impl fmt::Display for Address {
 pub enum OutboundType {
     /// Direct connection, optionally carrying pre-resolved socket addresses
     /// from DNS lookup in the router (avoids duplicate resolution in connect).
+    ///
+    /// `dialer` is set for a `direct` outbound with custom dialing options
+    /// (bind/mode/fastOpen/nodelay/keepalive/connectTimeout) that
+    /// `connect_target()` cannot apply: the connect path dials through it,
+    /// feeding it `resolved` so the handler binds without re-resolving
+    /// (preserving the SSRF check). `None` means a plain direct connection via
+    /// `connect_target()`.
     Direct {
         resolved: Option<Arc<[SocketAddr]>>,
+        dialer: Option<Arc<dyn acl_engine_rs::outbound::AsyncOutbound>>,
     },
     Reject,
     /// Proxy connection via ACL engine outbound handler (Socks5, Http, etc.)
@@ -179,7 +187,10 @@ pub struct DirectRouter;
 #[async_trait]
 impl OutboundRouter for DirectRouter {
     async fn route(&self, _target: &Address) -> OutboundType {
-        OutboundType::Direct { resolved: None }
+        OutboundType::Direct {
+            resolved: None,
+            dialer: None,
+        }
     }
 }
 
