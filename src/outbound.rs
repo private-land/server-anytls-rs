@@ -145,15 +145,37 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let trailing = buf[consumed..n].to_vec();
     let outbound = server.router.route(&target).await;
     match outbound {
-        OutboundType::Direct { resolved } => {
+        OutboundType::Direct {
+            resolved,
+            dialer: None,
+        } => {
             proxy_tcp(
                 server, session, stream, &target, trailing, user_id, resolved, cancel,
             )
             .await
         }
-        OutboundType::Proxy(handler) => {
+        OutboundType::Direct {
+            resolved,
+            dialer: Some(handler),
+        } => {
+            // Custom-dial direct: dial through the handler so its bind/mode/TCP
+            // options apply. Feed it the router's already-SSRF-checked IPs so it
+            // binds without re-resolving (a fresh lookup could reach an
+            // unchecked, private IP).
+            let mut acl_addr =
+                acl_engine_rs::outbound::Addr::new(target.host_string(), target.port());
+            if let Some(addrs) = resolved.as_deref() {
+                acl_addr = acl_addr.with_resolve_info(resolve_info_from_addrs(addrs));
+            }
             proxy_tcp_via_handler(
-                server, session, stream, &target, trailing, user_id, handler, cancel,
+                server, session, stream, &target, acl_addr, trailing, user_id, handler, cancel,
+            )
+            .await
+        }
+        OutboundType::Proxy(handler) => {
+            let acl_addr = acl_engine_rs::outbound::Addr::new(target.host_string(), target.port());
+            proxy_tcp_via_handler(
+                server, session, stream, &target, acl_addr, trailing, user_id, handler, cancel,
             )
             .await
         }
@@ -209,22 +231,36 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     relay_and_record(server, stream, remote, trailing, user_id, cancel).await
 }
 
-/// Connect via an ACL outbound handler (Socks5, Http, etc.) and relay data.
+/// Collapse resolved socket addresses into a `ResolveInfo` (one IPv4 + one
+/// IPv6) that a custom-dial `Direct` handler consumes instead of re-resolving.
+/// All addresses have already passed the router's private-IP (SSRF) check.
+fn resolve_info_from_addrs(addrs: &[SocketAddr]) -> acl_engine_rs::outbound::ResolveInfo {
+    let mut info = acl_engine_rs::outbound::ResolveInfo::new();
+    for addr in addrs {
+        match addr.ip() {
+            std::net::IpAddr::V4(v4) if info.ipv4.is_none() => info.ipv4 = Some(v4),
+            std::net::IpAddr::V6(v6) if info.ipv6.is_none() => info.ipv6 = Some(v6),
+            _ => {}
+        }
+    }
+    info
+}
+
+/// Connect via an ACL outbound handler (Socks5, Http, or a custom-dial Direct)
+/// using the pre-built `acl_addr`, then relay data.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_tcp_via_handler<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
     session: Arc<Session<T>>,
     stream: Stream,
     target: &Address,
+    mut acl_addr: acl_engine_rs::outbound::Addr,
     trailing: Vec<u8>,
     user_id: UserId,
     handler: Arc<dyn acl_engine_rs::outbound::AsyncOutbound>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    use acl_engine_rs::outbound::Addr;
-
     let stream_id = stream.id();
-    let mut acl_addr = Addr::new(target.host_string(), target.port());
 
     let connect_result = tokio::time::timeout(
         server.config.tcp_connect_timeout,
@@ -734,6 +770,123 @@ mod tests {
             "RELAY_BUF_SIZE should be <= 64KB for reasonable memory usage \
              under high concurrency, but is {} KB",
             RELAY_BUF_SIZE / 1024
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Custom-dial direct: the TCP session path must dial through the
+    // handler's dialer (applying its bind/mode/TCP options) instead of
+    // the bare connect_target(), feeding it the router's already-checked
+    // IPs via ResolveInfo so it binds without re-resolving.
+    // -----------------------------------------------------------------
+
+    use crate::core::hooks::OutboundRouter;
+    use std::sync::Mutex;
+
+    /// `(host, port, resolve_info.ipv4)` captured by the mock dialer.
+    type DialRecord = (String, u16, Option<std::net::Ipv4Addr>);
+
+    /// Records the `Addr` handed to `dial_tcp`, then fails the dial. The
+    /// recorded value proves whether the consumer routed through the dialer.
+    struct RecordingDialer {
+        seen: Arc<Mutex<Option<DialRecord>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl acl_engine_rs::outbound::AsyncOutbound for RecordingDialer {
+        async fn dial_tcp(
+            &self,
+            addr: &mut acl_engine_rs::outbound::Addr,
+        ) -> acl_engine_rs::Result<Box<dyn acl_engine_rs::outbound::AsyncTcpConn>> {
+            let v4 = addr.resolve_info().and_then(|ri| ri.ipv4);
+            *self.seen.lock().unwrap() = Some((addr.host().to_string(), addr.port(), v4));
+            Err(std::io::Error::other("mock dialer refuses").into())
+        }
+
+        async fn dial_udp(
+            &self,
+            _addr: &mut acl_engine_rs::outbound::Addr,
+        ) -> acl_engine_rs::Result<Box<dyn acl_engine_rs::outbound::AsyncUdpConn>> {
+            Err(std::io::Error::other("unused").into())
+        }
+    }
+
+    /// Router that always returns a custom-dial Direct decision carrying the
+    /// given dialer and pre-resolved IPs.
+    struct DialerRouter {
+        dialer: Arc<dyn acl_engine_rs::outbound::AsyncOutbound>,
+        resolved: Option<Arc<[std::net::SocketAddr]>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundRouter for DialerRouter {
+        async fn route(&self, _target: &Address) -> OutboundType {
+            OutboundType::Direct {
+                resolved: self.resolved.clone(),
+                dialer: Some(self.dialer.clone()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_dial_direct_routes_through_dialer() {
+        use crate::core::hooks::SinglePasswordAuth;
+        use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
+        use crate::core::session::{Session, SessionConfig};
+        use crate::core::stream::{Stream, WriteCommand};
+
+        let seen = Arc::new(Mutex::new(None));
+        let dialer = Arc::new(RecordingDialer { seen: seen.clone() });
+        // Router feeds a checked IPv4 (1.2.3.4, port 0 as produced by the DNS
+        // cache) alongside the dialer.
+        let resolved: Arc<[std::net::SocketAddr]> =
+            Arc::from(vec![std::net::SocketAddr::from(([1, 2, 3, 4], 0))].into_boxed_slice());
+        let router = Arc::new(DialerRouter {
+            dialer: dialer as Arc<dyn acl_engine_rs::outbound::AsyncOutbound>,
+            resolved: Some(resolved),
+        });
+
+        let server = Arc::new(
+            Server::builder()
+                .authenticator(Arc::new(SinglePasswordAuth::new("test")))
+                .router(router)
+                .build()
+                .unwrap(),
+        );
+
+        let (_client_io, server_io) = tokio::io::duplex(65536);
+        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+
+        let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
+        tokio::spawn(async move { while write_cmd_rx.recv().await.is_some() {} });
+        let (data_tx, stream) = Stream::new(1, write_cmd_tx, 128);
+
+        // SOCKS5 domain address example.com:443
+        let mut addr_data = vec![0x03u8, 11];
+        addr_data.extend_from_slice(b"example.com");
+        addr_data.extend_from_slice(&443u16.to_be_bytes());
+        data_tx.send(bytes::Bytes::from(addr_data)).await.unwrap();
+        drop(data_tx);
+
+        // Dial fails (mock), so handle_stream returns Err — that's expected.
+        let _ = handle_stream(server, session, stream, 7, CancellationToken::new()).await;
+
+        let rec = seen.lock().unwrap().clone();
+        let (host, port, v4) = rec.expect(
+            "custom-dial direct must be dialed through the handler's dialer, \
+             but the dialer was never invoked (consumer used connect_target)",
+        );
+        assert_eq!(host, "example.com", "dialer must receive the original host");
+        assert_eq!(port, 443, "dialer must receive the original port");
+        assert_eq!(
+            v4,
+            Some(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            "router's SSRF-checked IP must be fed to the dialer via ResolveInfo"
         );
     }
 }

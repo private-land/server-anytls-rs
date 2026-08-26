@@ -161,6 +161,14 @@ pub struct DirectConfig {
     /// TCP keepalive interval in seconds. 0 = disable. Default: 60.
     #[serde(rename = "tcpKeepAlive", default = "default_tcp_keepalive_secs")]
     pub tcp_keepalive_secs: u64,
+
+    /// Connect timeout in seconds for this outbound. 0 = use the built-in
+    /// default (10s). Intended to fail faster than the server's global
+    /// `tcp_connect_timeout`: the effective connect timeout is the smaller of
+    /// the two (the connect path also wraps the dial in `tcp_connect_timeout`),
+    /// so a value larger than `tcp_connect_timeout` has no additional effect.
+    #[serde(rename = "connectTimeout", default)]
+    pub connect_timeout_secs: u64,
 }
 
 fn default_ip_mode() -> String {
@@ -185,6 +193,7 @@ impl Default for DirectConfig {
             fast_open: false,
             tcp_nodelay: default_tcp_nodelay(),
             tcp_keepalive_secs: default_tcp_keepalive_secs(),
+            connect_timeout_secs: 0,
         }
     }
 }
@@ -192,8 +201,15 @@ impl Default for DirectConfig {
 /// Outbound handler wrapper
 #[derive(Clone)]
 pub enum OutboundHandler {
-    /// Direct connection
-    Direct(Arc<Direct>),
+    /// Direct connection. `custom_dial` is true when the outbound sets any
+    /// dialing option a bare `connect_target()` cannot apply — bindIPv4/bindIPv6/
+    /// bindDevice, a non-`auto` IP mode, TCP Fast Open, a non-default TCP_NODELAY,
+    /// a non-default keepalive, or a non-default connect timeout — so the router
+    /// routes such handlers through their own dialer (`inner`).
+    Direct {
+        inner: Arc<Direct>,
+        custom_dial: bool,
+    },
     /// SOCKS5 proxy
     Socks5 { inner: Arc<Socks5>, allow_udp: bool },
     /// HTTP proxy
@@ -205,7 +221,7 @@ pub enum OutboundHandler {
 impl std::fmt::Debug for OutboundHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OutboundHandler::Direct(_) => write!(f, "Direct"),
+            OutboundHandler::Direct { .. } => write!(f, "Direct"),
             OutboundHandler::Socks5 { allow_udp, .. } => write!(f, "Socks5(udp={})", allow_udp),
             OutboundHandler::Http(_) => write!(f, "Http"),
             OutboundHandler::Reject(_) => write!(f, "Reject"),
@@ -261,6 +277,12 @@ impl OutboundHandler {
                     .unwrap_or_else(default_tcp_keepalive_secs);
                 let tcp_keepalive = if tcp_keepalive_secs > 0 {
                     Some(std::time::Duration::from_secs(tcp_keepalive_secs))
+                } else {
+                    None
+                };
+                let connect_timeout_secs = config.map(|d| d.connect_timeout_secs).unwrap_or(0);
+                let connect_timeout = if connect_timeout_secs > 0 {
+                    Some(std::time::Duration::from_secs(connect_timeout_secs))
                 } else {
                     None
                 };
@@ -330,13 +352,27 @@ impl OutboundHandler {
                     ));
                 }
 
+                // Options that a bare connect_target() cannot apply; when any is
+                // set, the router must dial through this handler instead.
+                // connect_target() always forces TCP_NODELAY on and applies its
+                // own fixed keepalive, and never enables TFO, so those diverge
+                // from any non-default configuration here.
+                let custom_dial = bind_ip4.is_some()
+                    || bind_ip6.is_some()
+                    || bind_device.is_some()
+                    || direct_mode != DirectMode::Auto
+                    || fast_open
+                    || !tcp_nodelay
+                    || tcp_keepalive_secs != default_tcp_keepalive_secs()
+                    || connect_timeout.is_some();
+
                 let opts = DirectOptions {
                     mode: direct_mode,
                     bind_ip4,
                     bind_ip6,
                     bind_device,
                     fast_open,
-                    timeout: None,
+                    timeout: connect_timeout,
                     tcp_nodelay,
                     tcp_keepalive,
                 };
@@ -367,13 +403,19 @@ impl OutboundHandler {
                 } else {
                     parts.push("tcpKeepAlive=off".to_string());
                 }
+                if let Some(ct) = connect_timeout {
+                    parts.push(format!("connectTimeout={}s", ct.as_secs()));
+                }
                 log::info!(
                     outbound = %entry.name,
                     "Direct outbound configured: {}",
                     parts.join(", ")
                 );
 
-                Ok(OutboundHandler::Direct(Arc::new(direct)))
+                Ok(OutboundHandler::Direct {
+                    inner: Arc::new(direct),
+                    custom_dial,
+                })
             }
             "socks5" => {
                 let config = entry.socks5.as_ref().ok_or_else(|| {
@@ -437,11 +479,23 @@ impl OutboundHandler {
         )
     }
 
+    /// For a `direct` outbound carrying custom dialing options, return the
+    /// dialer to route through so those options are applied; otherwise `None`.
+    /// Plain direct outbounds return `None` and keep using `connect_target()`.
+    fn custom_dialer(self: &Arc<Self>) -> Option<Arc<dyn AsyncOutbound>> {
+        match self.as_ref() {
+            OutboundHandler::Direct {
+                custom_dial: true, ..
+            } => Some(self.clone() as Arc<dyn AsyncOutbound>),
+            _ => None,
+        }
+    }
+
     /// Check if this handler allows UDP
     #[allow(dead_code)]
     pub fn allows_udp(&self) -> bool {
         match self {
-            OutboundHandler::Direct(_) => true,
+            OutboundHandler::Direct { .. } => true,
             OutboundHandler::Socks5 { allow_udp, .. } => *allow_udp,
             OutboundHandler::Http(_) => false, // HTTP proxy doesn't support UDP
             OutboundHandler::Reject(_) => false,
@@ -453,7 +507,7 @@ impl OutboundHandler {
 impl AsyncOutbound for OutboundHandler {
     async fn dial_tcp(&self, addr: &mut Addr) -> acl_engine_rs::Result<Box<dyn AsyncTcpConn>> {
         match self {
-            OutboundHandler::Direct(d) => d.dial_tcp(addr).await,
+            OutboundHandler::Direct { inner, .. } => inner.dial_tcp(addr).await,
             OutboundHandler::Socks5 { inner, .. } => inner.dial_tcp(addr).await,
             OutboundHandler::Http(h) => h.dial_tcp(addr).await,
             OutboundHandler::Reject(r) => r.dial_tcp(addr).await,
@@ -462,7 +516,7 @@ impl AsyncOutbound for OutboundHandler {
 
     async fn dial_udp(&self, addr: &mut Addr) -> acl_engine_rs::Result<Box<dyn AsyncUdpConn>> {
         match self {
-            OutboundHandler::Direct(d) => d.dial_udp(addr).await,
+            OutboundHandler::Direct { inner, .. } => inner.dial_udp(addr).await,
             OutboundHandler::Socks5 { inner, .. } => inner.dial_udp(addr).await,
             OutboundHandler::Http(h) => h.dial_udp(addr).await,
             OutboundHandler::Reject(r) => r.dial_udp(addr).await,
@@ -508,9 +562,12 @@ impl AclEngine {
         outbounds
             .entry("reject".to_string())
             .or_insert_with(|| Arc::new(OutboundHandler::Reject(Arc::new(Reject::new()))));
-        outbounds
-            .entry("direct".to_string())
-            .or_insert_with(|| Arc::new(OutboundHandler::Direct(Arc::new(Direct::new()))));
+        outbounds.entry("direct".to_string()).or_insert_with(|| {
+            Arc::new(OutboundHandler::Direct {
+                inner: Arc::new(Direct::new()),
+                custom_dial: false,
+            })
+        });
 
         // Step 3: Get rules or use default
         let rules = if config.acl.inline.is_empty() {
@@ -570,7 +627,10 @@ impl AclEngine {
         let mut outbounds: HashMap<String, Arc<OutboundHandler>> = HashMap::new();
         outbounds.insert(
             "direct".to_string(),
-            Arc::new(OutboundHandler::Direct(Arc::new(Direct::new()))),
+            Arc::new(OutboundHandler::Direct {
+                inner: Arc::new(Direct::new()),
+                custom_dial: false,
+            }),
         );
         outbounds.insert(
             "reject".to_string(),
@@ -778,6 +838,10 @@ impl AclRouter {
         let acl_result = self.engine.match_host(&host, port, protocol);
 
         // Proxy / Reject: return immediately, no DNS needed on our side.
+        // A `direct` handler with custom dialing options is captured here and
+        // attached to the Direct decision *after* the SSRF check below, so its
+        // options are applied while still honoring private-IP blocking.
+        let mut dialer: Option<Arc<dyn AsyncOutbound>> = None;
         if let Some(handler) = acl_result {
             if handler.is_proxy() {
                 return OutboundType::Proxy(handler);
@@ -785,6 +849,7 @@ impl AclRouter {
             if handler.is_reject() {
                 return OutboundType::Reject;
             }
+            dialer = handler.custom_dialer();
         }
 
         // Direct route — resolve DNS for domain addresses so connect_target()
@@ -820,8 +885,13 @@ impl AclRouter {
             }
         }
 
+        // `dialer` is Some for a custom-dial direct outbound: the connect path
+        // dials through it, feeding it `resolved` so its bind/mode/TCP options
+        // apply without re-resolving (the SSRF check above has already run on
+        // exactly those IPs). Plain direct keeps the connect_target() path.
         OutboundType::Direct {
             resolved: resolved_addrs,
+            dialer,
         }
     }
 }
@@ -883,7 +953,7 @@ acl:
         };
 
         let handler = OutboundHandler::from_entry(&entry).unwrap();
-        assert!(matches!(handler, OutboundHandler::Direct(_)));
+        assert!(matches!(handler, OutboundHandler::Direct { .. }));
         assert!(handler.allows_udp());
         assert!(!handler.is_reject());
     }
@@ -1053,7 +1123,7 @@ acl:
             };
 
             let handler = OutboundHandler::from_entry(&entry).unwrap();
-            assert!(matches!(handler, OutboundHandler::Direct(_)));
+            assert!(matches!(handler, OutboundHandler::Direct { .. }));
         }
     }
 
@@ -1176,7 +1246,7 @@ acl:
             }),
         };
         let handler = OutboundHandler::from_entry(&entry).unwrap();
-        assert!(matches!(handler, OutboundHandler::Direct(_)));
+        assert!(matches!(handler, OutboundHandler::Direct { .. }));
     }
 
     #[test]
@@ -1212,7 +1282,7 @@ acl:
             }),
         };
         let handler = OutboundHandler::from_entry(&entry).unwrap();
-        assert!(matches!(handler, OutboundHandler::Direct(_)));
+        assert!(matches!(handler, OutboundHandler::Direct { .. }));
     }
 
     #[test]
@@ -1287,7 +1357,210 @@ acl:
             }),
         };
         let handler = OutboundHandler::from_entry(&entry).unwrap();
-        assert!(matches!(handler, OutboundHandler::Direct(_)));
+        assert!(matches!(handler, OutboundHandler::Direct { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // custom-dial routing: a `direct` outbound with options that
+    // connect_target() cannot apply (bind/mode/fastOpen/nodelay/keepalive/
+    // connectTimeout) must be dialed through the handler, surfaced as
+    // `Direct { dialer: Some(_) }`. Ported from server-mieru-rs.
+    // -----------------------------------------------------------------
+    mod dialer_routing {
+        use super::super::*;
+        use server_anytls_rs::{Address, OutboundRouter, OutboundType};
+
+        /// Build an `AclEngine` whose only rule (`bound(all)`) routes every host
+        /// to a single custom `direct` outbound built from `direct`.
+        async fn engine_with_bound_direct(direct: DirectConfig) -> AclEngine {
+            let config = AclConfig {
+                outbounds: vec![OutboundEntry {
+                    name: "bound".to_string(),
+                    outbound_type: "direct".to_string(),
+                    socks5: None,
+                    http: None,
+                    direct: Some(direct),
+                }],
+                acl: AclRules {
+                    inline: vec!["bound(all)".to_string()],
+                },
+            };
+            AclEngine::new(config, None, false)
+                .await
+                .expect("engine builds")
+        }
+
+        /// A `direct` outbound with `bindIPv4` must be dialed through the handler
+        /// so the bind is applied — surfaced as `Direct { dialer: Some(_) }`.
+        /// Before the fix the router dropped the Direct handler and returned a
+        /// plain `Direct { dialer: None }`, routing to `connect_target()` which
+        /// knows nothing about bind/mode, so the bind was silently lost.
+        #[tokio::test]
+        async fn custom_bind_direct_carries_dialer() {
+            let engine = engine_with_bound_direct(DirectConfig {
+                bind_ipv4: Some("127.0.0.1".to_string()),
+                ..Default::default()
+            })
+            .await;
+            let router = AclRouter::with_block_private_ip(engine, true);
+
+            // IP literal: no DNS involved, isolates the routing decision.
+            let result = router.route(&Address::IPv4([1, 2, 3, 4], 443)).await;
+
+            match result {
+                OutboundType::Direct {
+                    dialer: Some(_), ..
+                } => {}
+                other => panic!("custom-bind direct must carry a dialer, got {other:?}"),
+            }
+        }
+
+        /// `fastOpen`/`tcpNoDelay`/`mode` are also options `connect_target()`
+        /// cannot honor, so a direct outbound setting any of them (even with no
+        /// bind) must route through the handler.
+        #[tokio::test]
+        async fn direct_with_non_default_tcp_options_carries_dialer() {
+            for direct in [
+                DirectConfig {
+                    fast_open: true,
+                    ..Default::default()
+                },
+                DirectConfig {
+                    tcp_nodelay: false,
+                    ..Default::default()
+                },
+                DirectConfig {
+                    mode: "4".to_string(),
+                    ..Default::default()
+                },
+            ] {
+                let label = format!("{direct:?}");
+                let engine = engine_with_bound_direct(direct).await;
+                let router = AclRouter::with_block_private_ip(engine, true);
+                let result = router.route(&Address::IPv4([1, 2, 3, 4], 443)).await;
+                assert!(
+                    matches!(
+                        result,
+                        OutboundType::Direct {
+                            dialer: Some(_),
+                            ..
+                        }
+                    ),
+                    "config {label} must carry a dialer, got {result:?}"
+                );
+            }
+        }
+
+        /// Guard: a plain `direct` outbound (all defaults) must keep using the
+        /// `connect_target()` path — `Direct { dialer: None }`. Because
+        /// `match_host` falls back to the `direct` handler for unmatched traffic,
+        /// rerouting *all* Direct handlers through the dialer would change the
+        /// default path for every connection.
+        #[tokio::test]
+        async fn plain_direct_carries_no_dialer() {
+            let engine = AclEngine::new_default().expect("default engine builds");
+            let router = AclRouter::with_block_private_ip(engine, true);
+
+            let result = router.route(&Address::IPv4([1, 2, 3, 4], 443)).await;
+
+            assert!(
+                matches!(result, OutboundType::Direct { dialer: None, .. }),
+                "plain direct must stay on the connect_target path, got {result:?}"
+            );
+        }
+
+        /// A custom-dial direct outbound targeting a domain must hand the handler
+        /// the router's already-SSRF-checked IPs (`resolved`) so the handler
+        /// binds without re-resolving — otherwise a rebinding domain could
+        /// connect to an unchecked, private IP (SSRF). The decision must carry
+        /// BOTH the dialer AND the checked resolution.
+        #[tokio::test]
+        async fn custom_dial_direct_domain_carries_checked_ips() {
+            use std::net::{IpAddr, Ipv4Addr};
+            let public_ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+            let mock = Arc::new(dns_cache_rs::MockResolver::new());
+            mock.set("target.test", Ok(vec![public_ip]));
+            let cache = dns_cache_rs::DnsCache::builder()
+                .resolver_arc(mock)
+                .query_timeout(Some(std::time::Duration::from_millis(100)))
+                .build()
+                .expect("cache builds");
+            let engine = engine_with_bound_direct(DirectConfig {
+                bind_ipv4: Some("127.0.0.1".to_string()),
+                ..Default::default()
+            })
+            .await;
+            let router = AclRouter::with_dns_cache(engine, true, cache);
+
+            let result = router
+                .route(&Address::Domain("target.test".to_string(), 443))
+                .await;
+
+            match result {
+                OutboundType::Direct {
+                    resolved: Some(addrs),
+                    dialer: Some(_),
+                } => {
+                    assert_eq!(addrs.len(), 1);
+                    assert_eq!(addrs[0].ip(), public_ip, "handler must get checked IP");
+                }
+                other => panic!("expected Direct with checked IPs and a dialer, got {other:?}"),
+            }
+        }
+
+        /// A non-default connect timeout is a dialing option the bare
+        /// connect_target() path cannot apply, so it must route through the
+        /// outbound's own dialer.
+        #[tokio::test]
+        async fn direct_with_custom_connect_timeout_carries_dialer() {
+            let engine = engine_with_bound_direct(DirectConfig {
+                connect_timeout_secs: 5,
+                ..Default::default()
+            })
+            .await;
+            let router = AclRouter::with_block_private_ip(engine, true);
+            let result = router.route(&Address::IPv4([1, 2, 3, 4], 443)).await;
+            assert!(
+                matches!(
+                    result,
+                    OutboundType::Direct {
+                        dialer: Some(_),
+                        ..
+                    }
+                ),
+                "custom connectTimeout must carry a dialer, got {result:?}"
+            );
+        }
+
+        /// The SSRF guard must still reject a custom-dial direct outbound whose
+        /// domain resolves to a private IP — the private-IP block runs before
+        /// the dialer is attached.
+        #[tokio::test]
+        async fn custom_dial_direct_rejects_private_resolution() {
+            use std::net::{IpAddr, Ipv4Addr};
+            let mock = Arc::new(dns_cache_rs::MockResolver::new());
+            mock.set(
+                "evil.test",
+                Ok(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]),
+            );
+            let cache = dns_cache_rs::DnsCache::builder()
+                .resolver_arc(mock)
+                .query_timeout(Some(std::time::Duration::from_millis(100)))
+                .build()
+                .expect("cache builds");
+            let engine = engine_with_bound_direct(DirectConfig {
+                bind_ipv4: Some("127.0.0.1".to_string()),
+                ..Default::default()
+            })
+            .await;
+            let router = AclRouter::with_dns_cache(engine, true, cache);
+
+            let result = router
+                .route(&Address::Domain("evil.test".to_string(), 443))
+                .await;
+
+            assert!(matches!(result, OutboundType::Reject), "got {result:?}");
+        }
     }
 
     #[test]
@@ -1334,6 +1607,23 @@ acl:
         assert_eq!(direct_cfg.bind_ipv4.as_deref(), Some("10.0.0.1"));
         assert_eq!(direct_cfg.bind_ipv6.as_deref(), Some("::1"));
         assert!(!direct_cfg.fast_open);
+    }
+
+    #[test]
+    fn test_direct_config_yaml_connect_timeout() {
+        let yaml = r#"
+outbounds:
+  - name: direct
+    type: direct
+    direct:
+      connectTimeout: 5
+acl:
+  inline:
+    - direct(all)
+"#;
+        let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
+        let direct_cfg = config.outbounds[0].direct.as_ref().unwrap();
+        assert_eq!(direct_cfg.connect_timeout_secs, 5);
     }
 
     #[test]
@@ -1419,7 +1709,10 @@ acl:
 
     #[test]
     fn test_outbound_handler_debug_format() {
-        let direct = OutboundHandler::Direct(Arc::new(Direct::new()));
+        let direct = OutboundHandler::Direct {
+            inner: Arc::new(Direct::new()),
+            custom_dial: false,
+        };
         assert_eq!(format!("{:?}", direct), "Direct");
 
         let reject = OutboundHandler::Reject(Arc::new(Reject::new()));
@@ -1553,7 +1846,7 @@ acl:
         // Port 80 should be direct
         let handler = engine.match_host("any.host.com", 80, Protocol::TCP);
         assert!(handler.is_some());
-        assert!(matches!(*handler.unwrap(), OutboundHandler::Direct(_)));
+        assert!(matches!(*handler.unwrap(), OutboundHandler::Direct { .. }));
     }
 
     #[tokio::test]
@@ -1662,7 +1955,7 @@ acl:
             let handler = engine.match_host("random-unknown-site.xyz", 80, Protocol::TCP);
             if let Some(h) = handler {
                 assert!(
-                    matches!(*h, OutboundHandler::Direct(_)),
+                    matches!(*h, OutboundHandler::Direct { .. }),
                     "Unknown domain should be direct"
                 );
             }
@@ -2236,7 +2529,7 @@ acl:
         let engine = AclEngine::new(config, None, false).await.unwrap();
 
         let is_warp = |h: &OutboundHandler| matches!(h, OutboundHandler::Socks5 { .. });
-        let is_direct = |h: &OutboundHandler| matches!(h, OutboundHandler::Direct(_));
+        let is_direct = |h: &OutboundHandler| matches!(h, OutboundHandler::Direct { .. });
 
         let tcp = Protocol::TCP;
         let udp = Protocol::UDP;
