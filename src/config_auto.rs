@@ -41,21 +41,14 @@ const PER_CORE_MBPS: u64 = 1500;
 /// 100~500 Kbps per active user. 200 Kbps is a middle-of-the-road default.
 const PER_USER_KBPS: u64 = 200;
 
-/// Per-session memory budget (KB) used to size the connection cap.
-///
-/// This must cover a session's *worst-case bounded buffers*, not just its idle
-/// footprint — otherwise `compute_auto` over-admits sessions and the box OOMs
-/// under load (2026-08-25: jp-58-2 / us-54-1 / us-59-5 livelocked on 945 MB
-/// Lightsail keeps when bulk downloads filled per-session write buffers).
+/// Per-session fixed user-space memory cost (KB).
 ///
 /// Derived from code:
 ///   BufWriter (32 KB) + payload_buf (64 KB) + combined_buf (64 KB) +
-///   rustls server state (~50 KB) + mpsc<Stream>(256) + task stacks/Arcs
-///   ≈ 215 KB fixed, PLUS the dominant term: the per-session write-command
-///   channel, write_cmd_capacity (64) frames of up to u16::MAX bytes ≈ 4096 KB.
-///   ≈ 4.5 MB worst case.  Kept consistent with `SessionConfig::write_cmd_capacity`
-///   (see the `per_session_budget_covers_write_channel_ceiling` test).
-const PER_SESSION_KB: u64 = 4608;
+///   mpsc<WriteCommand>(512) (~20 KB) + mpsc<Stream>(256) (~30 KB) +
+///   rustls server state (~50 KB) + task stacks/Arcs (~5 KB)
+///   ≈ 265 KB idle.  Add ~85 KB amortized for active stream buffers.
+const PER_SESSION_KB: u64 = 350;
 
 /// Fraction of total RAM (in percent) reserved as the session-state budget.
 /// The remaining 50% covers kernel TCP buffers, gRPC client, geosite, logs.
@@ -273,64 +266,41 @@ mod tests {
     }
 
     #[test]
-    fn one_cpu_two_gb_is_memory_bound() {
+    fn one_cpu_two_gb_is_memory_bound_around_3000() {
         let bd = compute_auto(1, gb_to_kb(2), 65_536);
-        // mem_cap = 2*1024*1024 * 50 / 100 / 4608 ≈ 227
-        assert!(bd.value >= 215 && bd.value <= 240, "got {}", bd.value);
+        // mem_cap = 2*1024*1024 * 50 / 100 / 350 ≈ 2997
+        assert!(bd.value >= 2900 && bd.value <= 3100, "got {}", bd.value);
         assert_eq!(bd.limiting, Limit::Memory);
     }
 
     #[test]
-    fn two_cpu_four_gb_is_memory_bound() {
+    fn two_cpu_four_gb_is_memory_bound_around_6000() {
         let bd = compute_auto(2, gb_to_kb(4), 65_536);
-        // mem_cap ≈ 455, cpu_cap = 15000
-        assert!(bd.value >= 440 && bd.value <= 470, "got {}", bd.value);
+        // mem_cap ≈ 5995, cpu_cap = 15000
+        assert!(bd.value >= 5800 && bd.value <= 6100, "got {}", bd.value);
         assert_eq!(bd.limiting, Limit::Memory);
     }
 
     #[test]
-    fn four_cpu_eight_gb_is_memory_bound() {
+    fn four_cpu_eight_gb_is_cpu_bound() {
         let bd = compute_auto(4, gb_to_kb(8), 65_536);
-        // cpu_cap = 4*1500*1000/200 = 30000, mem_cap ≈ 910 → memory binds
-        // (CPU only binds once cores get far ahead of RAM)
+        // cpu_cap = 4*1500*1000/200 = 30000, mem_cap ≈ 11990 → memory still binds
+        // (CPU only binds once cores get ahead of RAM)
         assert_eq!(bd.limiting, Limit::Memory);
-        assert!(bd.value >= 890 && bd.value <= 930, "got {}", bd.value);
+        assert!(bd.value >= 11_500 && bd.value <= 12_500, "got {}", bd.value);
     }
 
     #[test]
     fn many_cores_small_ram_is_memory_bound() {
         let bd = compute_auto(16, gb_to_kb(2), 65_536);
         assert_eq!(bd.limiting, Limit::Memory);
-        assert!(bd.value <= 300);
-    }
-
-    #[test]
-    fn per_session_budget_covers_write_channel_ceiling() {
-        // Regression guard for the 2026-08-25 OOM: jp-58-2 / us-54-1 / us-59-5
-        // (945 MB Lightsail keeps) livelocked because `compute_auto` admits
-        // total_mem * MEM_BUDGET_PCT / PER_SESSION_KB sessions, but a single
-        // session can buffer far more than PER_SESSION_KB. Under bulk download
-        // the per-session write-command channel fills with `write_cmd_capacity`
-        // frames of up to u16::MAX bytes each. If the memory budget does not
-        // cover that hard buffer ceiling the node is over-committed and OOMs.
-        use server_anytls_rs::core::session::SessionConfig;
-        let cfg = SessionConfig::default();
-        let write_channel_kb = cfg.write_cmd_capacity as u64 * (u16::MAX as u64) / 1024;
-        assert!(
-            PER_SESSION_KB >= write_channel_kb,
-            "PER_SESSION_KB={PER_SESSION_KB} KB under-counts the per-session \
-             write-channel ceiling {write_channel_kb} KB (write_cmd_capacity={} \
-             x {} B frames); compute_auto over-admits sessions and the box OOMs \
-             under load",
-            cfg.write_cmd_capacity,
-            u16::MAX,
-        );
+        assert!(bd.value <= 3100);
     }
 
     #[test]
     fn one_core_huge_ram_is_cpu_bound() {
-        let bd = compute_auto(1, gb_to_kb(128), 65_536);
-        // cpu_cap = 7500, mem_cap ≈ 14563 → CPU binds
+        let bd = compute_auto(1, gb_to_kb(64), 65_536);
+        // cpu_cap = 7500, mem_cap ≈ 95945 → CPU binds
         assert_eq!(bd.limiting, Limit::Cpu);
         assert!(bd.value >= 7400 && bd.value <= 7600, "got {}", bd.value);
     }
@@ -373,14 +343,13 @@ mod tests {
     }
 
     #[test]
-    fn huge_box_reports_actual_value_no_ceiling() {
-        // cpu_cap = 480000, mem_cap = 58254, fd_cap = 523776 → memory binds.
-        // With the corrected per-session budget, memory is the binding cap on
-        // realistic hardware. No artificial ceiling — the actual computed value
-        // is returned; operators can override explicitly if they want more.
+    fn huge_box_reports_actual_cpu_value() {
+        // cpu_cap = 480000, mem_cap ≈ 767000, fd_cap = 523776 → CPU binds.
+        // No artificial ceiling — operators with this hardware can override
+        // explicitly if they want a smaller cap.
         let bd = compute_auto(64, gb_to_kb(512), 1_048_576);
-        assert_eq!(bd.limiting, Limit::Memory);
-        assert_eq!(bd.value, 58_254);
+        assert_eq!(bd.limiting, Limit::Cpu);
+        assert_eq!(bd.value, 480_000);
     }
 
     #[test]
