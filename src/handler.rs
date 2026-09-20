@@ -83,6 +83,7 @@ pub(crate) async fn handle_connection(
 
     // Register connection after successful authentication
     let (conn_id, cancel_token) = server.connection_manager.register(user_id, peer_addr);
+    tracing::info!(user_id, conn_id, peer = %peer_addr, "client connected");
     // Ensure unregister on exit (even on panic)
     let conn_mgr = server.connection_manager.clone();
     let _guard = scopeguard::guard(conn_id, move |id| {
