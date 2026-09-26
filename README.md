@@ -54,6 +54,9 @@ All arguments support environment variables with `X_PANDA_ANYTLS_` prefix.
 | `--acl_conf_file` | (none) | ACL rules YAML file |
 | `--block_private_ip` | `true` | Block private IP connections |
 | `--max_connections` | `auto` | Global connection limit. `auto` derives a cap from `min(cpu_throughput, ram_budget, fd_limit)`; pass a positive integer to override. |
+| `--write_buf_size` | `32768` | BufWriter buffer size for the TLS write half, in bytes. |
+| `--stream_channel_capacity` | `128` | Per-stream data channel capacity (number of buffered messages). |
+| `--downlink_padding` | `true` | Server-side downlink padding: shapes downlink TLS record sizes so the record-length sequence carries no TLS-in-TLS signature. Only applies to clients announcing protocol v2 — legacy clients are byte-for-byte unaffected. Set `false` to fall back to the unshaped write path (useful as a control when measuring block rates). |
 | `--refresh_geodata` | `false` | Force refresh ACL geodata |
 
 ## Benchmark: Rust vs Go

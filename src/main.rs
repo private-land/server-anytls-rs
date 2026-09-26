@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
         .connection_manager(connection_manager.clone())
         .max_connections(resolved_max.value)
         .write_buf_size(cli.write_buf_size)
+        .downlink_padding(cli.downlink_padding)
         .stream_channel_capacity(cli.stream_channel_capacity);
 
     if let Some(ref rules) = remote_config.padding_rules
