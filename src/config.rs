@@ -130,6 +130,20 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_ANYTLS_WRITE_BUF_SIZE", default_value_t = 32 * 1024, help_heading = "Performance")]
     pub write_buf_size: usize,
 
+    /// Server-side downlink padding ("补包"): shape downlink record sizes so
+    /// the TLS record-length sequence carries no TLS-in-TLS signature.
+    ///
+    /// Only applies to clients announcing protocol v2; legacy clients are
+    /// byte-for-byte unaffected. Disable to fall back to the unshaped write
+    /// path (useful as a control when measuring block rates).
+    #[arg(
+        long,
+        env = "X_PANDA_ANYTLS_DOWNLINK_PADDING",
+        default_value_t = true,
+        help_heading = "Performance"
+    )]
+    pub downlink_padding: bool,
+
     /// Per-stream data channel capacity (number of buffered messages).
     #[arg(
         long,
@@ -227,6 +241,7 @@ mod tests {
             server_name: None,
             ca_file: None,
             write_buf_size: 32 * 1024,
+            downlink_padding: true,
             stream_channel_capacity: 128,
         }
     }
@@ -357,6 +372,7 @@ mod tests {
     fn test_cli_args_performance_defaults() {
         let cli = create_test_cli_args();
         assert_eq!(cli.write_buf_size, 32 * 1024);
+        assert!(cli.downlink_padding);
         assert_eq!(cli.stream_channel_capacity, 128);
     }
 

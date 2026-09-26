@@ -40,6 +40,12 @@ pub struct ServerConfig {
     pub handshake_timeout: Duration,
     /// BufWriter buffer size for the TLS write half (bytes).
     pub write_buf_size: usize,
+    /// Operator switch for server-side downlink padding ("补包").
+    ///
+    /// Enabled by default but only takes effect for peers that announce
+    /// protocol v2, so legacy clients see byte-identical output. See
+    /// [`crate::core::downlink_padding`].
+    pub downlink_padding: bool,
     /// Per-stream data channel capacity (number of buffered messages).
     pub stream_channel_capacity: usize,
     /// Maximum time a relay (`copy_bidirectional`) may be idle (no bytes
@@ -56,6 +62,7 @@ impl Default for ServerConfig {
             tcp_connect_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
             write_buf_size: DEFAULT_WRITE_BUF_SIZE,
+            downlink_padding: true,
             stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
             relay_idle_timeout: Duration::from_secs(60),
         }
@@ -90,6 +97,7 @@ impl Server {
         SessionConfig {
             max_streams: self.config.max_streams_per_session,
             write_buf_size: self.config.write_buf_size,
+            downlink_padding: self.config.downlink_padding,
             stream_channel_capacity: self.config.stream_channel_capacity,
             ..SessionConfig::default()
         }
@@ -164,6 +172,7 @@ pub struct ServerBuilder {
     tcp_connect_timeout: Duration,
     handshake_timeout: Duration,
     write_buf_size: usize,
+    downlink_padding: bool,
     stream_channel_capacity: usize,
     relay_idle_timeout: Duration,
 }
@@ -183,6 +192,7 @@ impl ServerBuilder {
             tcp_connect_timeout: defaults.tcp_connect_timeout,
             handshake_timeout: defaults.handshake_timeout,
             write_buf_size: defaults.write_buf_size,
+            downlink_padding: defaults.downlink_padding,
             stream_channel_capacity: defaults.stream_channel_capacity,
             relay_idle_timeout: defaults.relay_idle_timeout,
         }
@@ -243,6 +253,11 @@ impl ServerBuilder {
         self
     }
 
+    pub fn downlink_padding(mut self, enabled: bool) -> Self {
+        self.downlink_padding = enabled;
+        self
+    }
+
     pub fn stream_channel_capacity(mut self, n: usize) -> Self {
         self.stream_channel_capacity = n;
         self
@@ -275,6 +290,7 @@ impl ServerBuilder {
             tcp_connect_timeout: self.tcp_connect_timeout,
             handshake_timeout: self.handshake_timeout,
             write_buf_size: self.write_buf_size,
+            downlink_padding: self.downlink_padding,
             stream_channel_capacity: self.stream_channel_capacity,
             relay_idle_timeout: self.relay_idle_timeout,
         };

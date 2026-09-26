@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::core::downlink_padding::WriteState;
 use crate::core::frame::{Command, FrameHeader, HEADER_SIZE};
 use crate::core::padding::PaddingFactory;
 use crate::core::stream::{Stream, WriteCommand};
@@ -17,8 +18,12 @@ use crate::error::Result;
 /// Does NOT flush — caller is responsible for flushing after batching.
 /// Header and payload are coalesced into a single write to avoid generating
 /// separate TLS records (each record adds ~29 bytes overhead + encryption).
-async fn write_psh_frames<W: AsyncWriteExt + Unpin>(
-    w: &mut W,
+///
+/// `w` is the shaper-aware [`WriteState`], so a record cut can land inside a
+/// frame; anytls frames are recovered from a byte stream, so that is invisible
+/// to the peer.
+async fn write_psh_frames<W: AsyncWrite + Unpin>(
+    w: &mut WriteState<W>,
     cmd: &WriteCommand,
     combined_buf: &mut Vec<u8>,
 ) -> std::io::Result<()> {
@@ -51,8 +56,8 @@ async fn write_psh_frames<W: AsyncWriteExt + Unpin>(
 /// Write a single WriteCommand: PSH data frames, then optionally a FIN frame.
 /// Routing FIN through the same writer task as PSH guarantees FIN is never
 /// sent before all preceding PSH data for that stream.
-async fn write_cmd_frame<W: AsyncWriteExt + Unpin>(
-    w: &mut W,
+async fn write_cmd_frame<W: AsyncWrite + Unpin>(
+    w: &mut WriteState<W>,
     cmd: &WriteCommand,
     combined_buf: &mut Vec<u8>,
 ) -> std::io::Result<()> {
@@ -110,6 +115,12 @@ pub struct SessionConfig {
     pub write_buf_size: usize,
     /// Per-stream data channel capacity (number of Bytes messages).
     pub stream_channel_capacity: usize,
+    /// Operator switch for server-side downlink padding ("补包").
+    ///
+    /// Enabled by default, but only ever takes effect for peers that announce
+    /// protocol v2, so legacy clients keep the exact wire behaviour they had
+    /// before this existed. See [`crate::core::downlink_padding`].
+    pub downlink_padding: bool,
 }
 
 impl Default for SessionConfig {
@@ -119,13 +130,14 @@ impl Default for SessionConfig {
             write_cmd_capacity: 512,
             write_buf_size: DEFAULT_WRITE_BUF_SIZE,
             stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
+            downlink_padding: true,
         }
     }
 }
 
 pub struct Session<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     read_half: Mutex<tokio::io::ReadHalf<T>>,
-    write_half: Arc<Mutex<tokio::io::BufWriter<tokio::io::WriteHalf<T>>>>,
+    write_half: Arc<Mutex<WriteState<tokio::io::WriteHalf<T>>>>,
     padding: PaddingFactory,
     config: SessionConfig,
     peer_version: AtomicU8,
@@ -135,10 +147,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
     pub fn new_server(conn: T, padding: PaddingFactory, config: SessionConfig) -> Self {
         let (read_half, write_half) = tokio::io::split(conn);
         let buf_size = config.write_buf_size;
+        let downlink_padding = config.downlink_padding;
         Self {
             read_half: Mutex::new(read_half),
-            write_half: Arc::new(Mutex::new(tokio::io::BufWriter::with_capacity(
-                buf_size, write_half,
+            write_half: Arc::new(Mutex::new(WriteState::new(
+                write_half,
+                buf_size,
+                downlink_padding,
             ))),
             padding,
             config,
@@ -424,6 +439,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             .map_err(|_| crate::error::Error::WriteTimeout)?;
 
         timed_write(async {
+            // A `SynAck` is the head of a proxied connection's downlink burst:
+            // the first bytes the peer sees for that stream, and the smallest
+            // record in it. Flag it as a head so the shaper fills it up into
+            // the head band instead of emitting a bare 28-byte record. No-op
+            // unless shaping is enabled (i.e. the peer announced v2).
+            if command == Command::SynAck {
+                w.shaper_mut().mark_burst_head();
+            }
             // Use stack buffer for small control frames (FIN, SynAck, HeartResponse, etc.)
             // to avoid heap allocation. Most control frames are ≤ 128 bytes.
             if total <= 128 {
@@ -505,6 +528,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             .await
             .map_err(|_| crate::error::Error::WriteTimeout)?;
         timed_write(async {
+            // This response is the session's first downlink write, so it is the
+            // burst head the shaper exists to fix: without shaping it is a
+            // ~40-byte record, which real servers never emit at the head of a
+            // connection. Enable shaping here rather than in the recv loop so
+            // that the switch and the first shaped record happen under the same
+            // lock — a legacy peer never reaches this point with v2 announced.
+            if self.peer_version.load(Ordering::Relaxed) >= 2 {
+                w.shaper_mut().enable();
+                w.shaper_mut().mark_burst_head();
+            }
             w.write_all(&buf).await?;
             w.flush().await?;
             Ok(())
@@ -883,6 +916,222 @@ mod tests {
             found_server_settings,
             "expected ServerSettings frame in response"
         );
+
+        drop(client_io);
+        let _ = handle.await;
+    }
+
+    /// Assert that nothing further arrives on `r` within `ms`. An unshaped
+    /// write is exactly one record; a shaped one always appends a Waste frame,
+    /// so "the stream goes quiet" is how we pin the legacy path down.
+    async fn assert_stream_quiet<R: AsyncReadExt + Unpin>(r: &mut R, ms: u64) {
+        let mut extra = [0u8; 1];
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(ms),
+            r.read_exact(&mut extra),
+        )
+        .await
+        {
+            // Timed out, or the peer closed: both mean no more bytes.
+            Err(_) => {}
+            Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("expected no further bytes, got 0x{:02x}", extra[0]),
+        }
+    }
+
+    /// A legacy (v=1) peer must see byte-for-byte the output the pre-shaper
+    /// server produced, *even though* `downlink_padding` defaults to true.
+    ///
+    /// A v=1 peer that already knows our padding scheme takes the early return
+    /// in `write_settings_response`, so `enable()` is never reached and the
+    /// shaper stays inert: `write_budget()` returns `usize::MAX` (no record
+    /// splits), `account()` returns false (no mid-write flush) and
+    /// `tail_padding()` returns 0 (no Waste frame). The assertions below are
+    /// absolute byte literals rather than values derived from the shaper's own
+    /// constants — deriving them would let a broken shaper assert itself.
+    #[tokio::test]
+    async fn test_legacy_peer_output_is_unshaped() {
+        let (mut client_io, server_io) = duplex(65536);
+        let config = SessionConfig::default();
+        assert!(
+            config.downlink_padding,
+            "padding is on by default; this test only means anything with it on"
+        );
+        let session = Arc::new(Session::new_server(server_io, test_padding(), config));
+
+        // v=1 + matching md5 ⇒ need_padding == false, need_server_settings ==
+        // false ⇒ write_settings_response returns before `enable()`.
+        let settings_data = format!("v=1\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
+                .await
+        });
+
+        // Let the settings frame land so the (absent) response path has run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        session.write_frame(Command::Psh, 7, b"data").await.unwrap();
+
+        // Exactly 7 header bytes + 4 payload bytes: one record, one frame.
+        // A shaped path would have split the write and/or appended a Waste
+        // frame at the tail.
+        let mut got = [0u8; 11];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client_io.read_exact(&mut got),
+        )
+        .await
+        .expect("timed out waiting for the Psh frame")
+        .expect("read failed");
+        assert_eq!(
+            got,
+            [2, 0, 0, 0, 7, 0, 4, b'd', b'a', b't', b'a'],
+            "legacy peer must receive the plain 11-byte Psh frame"
+        );
+        assert_stream_quiet(&mut client_io, 200).await;
+
+        drop(client_io);
+        let _ = handle.await;
+    }
+
+    /// Positive control: a v=2 peer that already knows our padding scheme needs
+    /// no UpdatePaddingScheme, but it *does* need ServerSettings — and that
+    /// frame is the session's burst head. Without shaping it is a ~10-byte
+    /// record, which is the TLS-in-TLS giveaway the feature exists to erase.
+    /// So the head record must come out padded up into the head band.
+    #[tokio::test]
+    async fn test_v2_peer_head_record_is_shaped() {
+        let (mut client_io, server_io) = duplex(65536);
+        let session = Arc::new(Session::new_server(
+            server_io,
+            test_padding(),
+            SessionConfig::default(),
+        ));
+
+        // v=2 + matching md5 ⇒ only ServerSettings is sent, via
+        // write_settings_response ⇒ enable() + mark_burst_head().
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
+                .await
+        });
+
+        // 1) The real frame: ServerSettings, stream 0, length 3, payload "v=2".
+        let mut settings_frame = [0u8; 10];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client_io.read_exact(&mut settings_frame),
+        )
+        .await
+        .expect("timed out waiting for ServerSettings")
+        .expect("read failed");
+        assert_eq!(
+            settings_frame,
+            [10, 0, 0, 0, 0, 0, 3, b'v', b'=', b'2'],
+            "first frame must be the 10-byte ServerSettings"
+        );
+
+        // 2) The Waste frame the shaper appends to fill the head out.
+        let mut waste_hdr = [0u8; HEADER_SIZE];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client_io.read_exact(&mut waste_hdr),
+        )
+        .await
+        .expect("head record was not padded: no Waste frame followed ServerSettings")
+        .expect("read failed");
+        assert_eq!(waste_hdr[0], Command::Waste as u8, "expected a Waste frame");
+        assert_eq!(
+            u32::from_be_bytes([waste_hdr[1], waste_hdr[2], waste_hdr[3], waste_hdr[4]]),
+            0,
+            "Waste frames use stream 0"
+        );
+        let waste_payload = u16::from_be_bytes([waste_hdr[5], waste_hdr[6]]) as usize;
+        let mut body = vec![0u8; waste_payload];
+        client_io.read_exact(&mut body).await.unwrap();
+        assert!(
+            body.iter().all(|&b| b == 0),
+            "Waste payload must be zero-filled"
+        );
+
+        // 3) The whole head record lands inside the head band. 320/1400 are
+        //    literals on purpose: reading them off HEAD_MIN/HEAD_MAX would make
+        //    this test tautological.
+        let pad_bytes = HEADER_SIZE + waste_payload;
+        let total = settings_frame.len() + pad_bytes;
+        assert!(
+            (320..=1400).contains(&total),
+            "padded head record should be 320..=1400 bytes, got {total} \
+             (10 real + {pad_bytes} padding)"
+        );
+        assert_stream_quiet(&mut client_io, 200).await;
+
+        drop(client_io);
+        let _ = handle.await;
+    }
+
+    /// Third leg: with the operator switch off, a v=2 peer gets the unshaped
+    /// path. `enable()` runs but `enabled` stays false because `configured` is
+    /// false, so the head record is the bare 10 bytes — same as legacy.
+    #[tokio::test]
+    async fn test_padding_disabled_is_unshaped_for_v2() {
+        let (mut client_io, server_io) = duplex(65536);
+        let config = SessionConfig {
+            downlink_padding: false,
+            ..SessionConfig::default()
+        };
+        let session = Arc::new(Session::new_server(server_io, test_padding(), config));
+
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
+                .await
+        });
+
+        let mut got = [0u8; 10];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client_io.read_exact(&mut got),
+        )
+        .await
+        .expect("timed out waiting for ServerSettings")
+        .expect("read failed");
+        assert_eq!(
+            got,
+            [10, 0, 0, 0, 0, 0, 3, b'v', b'=', b'2'],
+            "with padding disabled the head record must be the bare 10 bytes"
+        );
+        assert_stream_quiet(&mut client_io, 200).await;
 
         drop(client_io);
         let _ = handle.await;
@@ -2132,9 +2381,11 @@ mod tests {
 
         let (_client_io, server_io) = duplex(1024 * 1024);
         let (_, write_half) = tokio::io::split(server_io);
-        let writer = Arc::new(Mutex::new(tokio::io::BufWriter::with_capacity(
-            DEFAULT_WRITE_BUF_SIZE,
+        // Padding off: this test isolates the batch limit, not shaping.
+        let writer = Arc::new(Mutex::new(WriteState::new(
             write_half,
+            DEFAULT_WRITE_BUF_SIZE,
+            false,
         )));
         let (tx, mut rx) = mpsc::channel::<WriteCommand>(512);
 
