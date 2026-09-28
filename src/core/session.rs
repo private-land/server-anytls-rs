@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::core::downlink_padding::WriteState;
+use crate::core::downlink_padding::{ShapingCounters, ShapingStats, WriteState};
 use crate::core::frame::{Command, FrameHeader, HEADER_SIZE};
 use crate::core::padding::PaddingFactory;
 use crate::core::stream::{Stream, WriteCommand};
@@ -141,6 +141,10 @@ pub struct Session<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     padding: PaddingFactory,
     config: SessionConfig,
     peer_version: AtomicU8,
+    /// The shaper's counters, shared with the write state. Cloned out at
+    /// construction so the session can report them at close without ever
+    /// taking the write lock.
+    shaping_counters: Arc<ShapingCounters>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
@@ -148,21 +152,32 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let (read_half, write_half) = tokio::io::split(conn);
         let buf_size = config.write_buf_size;
         let downlink_padding = config.downlink_padding;
+        let write_state = WriteState::new(write_half, buf_size, downlink_padding);
+        // Clone the shaper's counters out of the write state so the session
+        // can report them at close without taking the write lock.
+        let shaping_counters = write_state.shaper().counters().clone();
         Self {
             read_half: Mutex::new(read_half),
-            write_half: Arc::new(Mutex::new(WriteState::new(
-                write_half,
-                buf_size,
-                downlink_padding,
-            ))),
+            write_half: Arc::new(Mutex::new(write_state)),
             padding,
             config,
             peer_version: AtomicU8::new(0),
+            shaping_counters,
         }
     }
 
     pub fn padding_md5(&self) -> &str {
         self.padding.md5_hex()
+    }
+
+    /// Snapshot the session's downlink-shaping counters.
+    ///
+    /// The counters are atomics behind an `Arc` shared with the write state,
+    /// so this takes no lock: it stays callable even while the writer task
+    /// might still be mid-write, and never stalls session teardown. The
+    /// handler uses it for the session-close `debug!` report.
+    pub fn shaping_stats(&self) -> ShapingStats {
+        self.shaping_counters.snapshot()
     }
 
     pub async fn recv_loop(
@@ -439,6 +454,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             .map_err(|_| crate::error::Error::WriteTimeout)?;
 
         timed_write(async {
+            // Close any partially-built record first, so this frame is never
+            // split across records. The data path cuts at the shaper's target
+            // and a cut can land inside a frame; a `write_all` control frame
+            // that hit the budget edge went out as a truncated header plus a
+            // bare 4-byte tail — and if the flush after the cut timed out
+            // (WRITE_TIMEOUT cancels the future mid-write), the remainder was a
+            // half header in the buffer that the next writer appended behind,
+            // corrupting the frame stream from there on. After this, a
+            // timed-out flush always leaves a *complete* frame buffered.
+            // Legacy v1 peers never have a pending record (the shaper is
+            // inert), so this is a no-op there and the wire stays byte-identical.
+            w.ensure_record_boundary().await?;
             // A `SynAck` is the head of a proxied connection's downlink burst:
             // the first bytes the peer sees for that stream, and the smallest
             // record in it. Flag it as a head so the shaper fills it up into
@@ -453,12 +480,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 let mut stack_buf = [0u8; 128];
                 stack_buf[..HEADER_SIZE].copy_from_slice(&hdr_buf);
                 stack_buf[HEADER_SIZE..total].copy_from_slice(data);
-                w.write_all(&stack_buf[..total]).await?;
+                w.write_atomic(&stack_buf[..total]).await?;
             } else {
                 let mut buf = Vec::with_capacity(total);
                 buf.extend_from_slice(&hdr_buf);
                 buf.extend_from_slice(data);
-                w.write_all(&buf).await?;
+                w.write_atomic(&buf).await?;
             }
             // Flush immediately so control frames are not delayed in the buffer.
             w.flush().await?;
@@ -977,8 +1004,26 @@ mod tests {
                 .await
         });
 
-        // Let the settings frame land so the (absent) response path has run.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Barrier instead of a sleep: the recv loop answers a HeartRequest with
+        // a bare 7-byte HeartResponse `[9,0,0,0,0,0,0]`. Reading it proves the
+        // Settings frame was processed — so `write_settings_response` ran its
+        // `enable()` decision for a v=1 peer and correctly skipped it — before
+        // the Psh output is measured. The old `sleep(50ms)` could pass
+        // vacuously if the loop was still settling.
+        write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
+        let mut heartbeat = [0u8; HEADER_SIZE];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client_io.read_exact(&mut heartbeat),
+        )
+        .await
+        .expect("timed out waiting for the HeartResponse barrier")
+        .expect("read failed");
+        assert_eq!(
+            heartbeat,
+            [9, 0, 0, 0, 0, 0, 0],
+            "server must answer with a bare 7-byte HeartResponse"
+        );
 
         session.write_frame(Command::Psh, 7, b"data").await.unwrap();
 
@@ -1090,9 +1135,105 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// Third leg: with the operator switch off, a v=2 peer gets the unshaped
-    /// path. `enable()` runs but `enabled` stays false because `configured` is
-    /// false, so the head record is the bare 10 bytes — same as legacy.
+    /// Pins the session-close report's accessor: `shaping_stats()` must see
+    /// the records the wire actually carried. A v=2 peer gets one shaped head
+    /// record (ServerSettings + Waste fill), so afterwards the counters show
+    /// records >= 1 and padding > 0. The handler gates its `debug!` line on
+    /// `records > 0`, so this is also what keeps a legacy session silent.
+    #[tokio::test]
+    async fn test_session_reports_shaping_stats() {
+        let (mut client_io, server_io) = duplex(65536);
+        let session = Arc::new(Session::new_server(
+            server_io,
+            test_padding(),
+            SessionConfig::default(),
+        ));
+
+        // v=2 + matching md5 ⇒ the head record is shaped: the ServerSettings
+        // write and the Waste fill happen synchronously inside recv_loop's
+        // Settings handler. The counters move under the write lock there, and
+        // only on a *successful* flush (`record_done`), so the record must get
+        // out before we tear the socket down: dropping `client_io` first makes
+        // the flush fail with BrokenPipe (tokio duplex closes the peer's read
+        // half), which skips `record_done` and leaves the counters at 0 — the
+        // exact false "no shaping" reading this test exists to catch.
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
+                .await
+        });
+
+        // Barrier: ServerSettings is a fixed 10 bytes; the Waste that follows
+        // it is the fill. Once both are read, the Settings handler's write and
+        // flush have completed, so the counters are final.
+        let mut settings_frame = [0u8; 10];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client_io.read_exact(&mut settings_frame),
+        )
+        .await
+        .expect("timed out waiting for the shaped head record")
+        .expect("read failed");
+        assert_eq!(
+            settings_frame,
+            [10, 0, 0, 0, 0, 0, 3, b'v', b'=', b'2'],
+            "first frame must be the 10-byte ServerSettings"
+        );
+
+        let mut waste_hdr = [0u8; HEADER_SIZE];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client_io.read_exact(&mut waste_hdr),
+        )
+        .await
+        .expect("no Waste frame followed the shaped head record")
+        .expect("read failed");
+        assert_eq!(waste_hdr[0], Command::Waste as u8, "expected a Waste frame");
+        let waste_payload = u16::from_be_bytes([waste_hdr[5], waste_hdr[6]]) as usize;
+        let mut waste_body = vec![0u8; waste_payload];
+        client_io.read_exact(&mut waste_body).await.unwrap();
+
+        // recv_loop parks on its next read after the Settings handler, so the
+        // counters are final now; dropping the client side just ends the loop.
+        drop(client_io);
+        let _ = handle.await;
+
+        let stats = session.shaping_stats();
+        assert!(
+            stats.records >= 1,
+            "the shaped head record must be counted, got {}",
+            stats.records
+        );
+        assert!(
+            stats.padded > 0,
+            "the head fill must spend padding bytes, got {}",
+            stats.padded
+        );
+        assert!(
+            stats.bytes >= stats.padded,
+            "bytes ({}) must cover the padding ({})",
+            stats.bytes,
+            stats.padded
+        );
+        assert!(
+            stats.padding_ratio() > 0.0,
+            "a padded session must have a positive padding ratio"
+        );
+    }
+
+    /// With `downlink_padding` off the shaper stays inert even for a v=2 peer:
+    /// the ServerSettings head record ships as a bare 10 bytes and nothing else
+    /// follows. Negative control to `test_v2_peer_head_record_is_shaped`.
     #[tokio::test]
     async fn test_padding_disabled_is_unshaped_for_v2() {
         let (mut client_io, server_io) = duplex(65536);

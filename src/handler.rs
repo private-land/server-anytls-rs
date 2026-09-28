@@ -118,7 +118,41 @@ pub(crate) async fn handle_connection(
         }
     });
 
-    session.recv_loop(new_stream_tx, cancel_token).await
+    // recv_loop takes the Arc by value, so clone first — the session's
+    // counters (atomics behind an Arc) are readable after it moves.
+    let session_for_loop = session.clone();
+    let result = session_for_loop
+        .recv_loop(new_stream_tx, cancel_token)
+        .await;
+
+    // Session-close report: the online cost of downlink padding is otherwise
+    // unobservable (ShapingCounters has no other consumer). `records == 0`
+    // means shaping never engaged — a legacy v1 peer, or the operator turned
+    // the feature off — so the line only fires for sessions that actually
+    // shaped, and doubles as a live v2-adoption signal.
+    //
+    // `debug!`, not `info!`: a per-session detail that would clutter even
+    // routine `info`-level troubleshooting logs, and it is invisible at the
+    // fleet default (log_mode=error). To measure, flip
+    // X_PANDA_ANYTLS_LOG_MODE=debug on a node for a while and grep journald
+    // for "downlink shaping".
+    let stats = session.shaping_stats();
+    if stats.records > 0 {
+        // Percent with one decimal, e.g. `padding_ratio=1.8%`: the raw
+        // fraction (0.018) reads ambiguously in a grep'd journald line.
+        let padding_ratio = format!("{:.1}%", stats.padding_ratio() * 100.0);
+        tracing::debug!(
+            user_id,
+            records = stats.records,
+            bytes = stats.bytes,
+            real_bytes = stats.real_bytes(),
+            padded = stats.padded,
+            padding_ratio,
+            "session closed: downlink shaping"
+        );
+    }
+
+    result
 }
 
 #[cfg(test)]

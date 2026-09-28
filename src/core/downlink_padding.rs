@@ -33,10 +33,11 @@
 //! bytes go into each flush, which is all this module does:
 //!
 //! * **split** — a record larger than [`SPLIT_MAX`] is cut into several records
-//!   of a randomised size inside `[SPLIT_MIN, SPLIT_MAX]`. This is nearly free:
-//!   a few extra record headers (~21 B per ~1.8 KB, ≈1 %) and it destroys the
-//!   outer-record ⇄ inner-record length correlation that makes a proxied
-//!   connection readable as TLS-in-TLS.
+//!   of a randomised size inside `[SPLIT_MIN, SPLIT_MAX]`. Each cut costs an
+//!   outer-record header (~21 B) and one AEAD encryption pass, so at the
+//!   ~1.8 KB average the overhead is ≈1 % of bytes and the session emits
+//!   ~9× more records than it would at 16 KiB — the byte cost is negligible,
+//!   the per-record cost is small but not zero.
 //! * **fill** — the first record of a *burst* (the session head, and the head of
 //!   each proxied connection's downlink, which starts at `SynAck`) is padded up
 //!   into `[HEAD_MIN, HEAD_MAX]` with a `Waste` frame. This is the only place
@@ -48,6 +49,11 @@
 //! partial record of a data flush) is **not** padded: real TLS servers end a
 //! burst with whatever is left over, and padding every small flush would turn a
 //! chatty client's one-line responses into 1 KB records for no gain.
+//!
+//! `HeartResponse`, `Fin` and `Alert` also stay bare 7-byte-payload records:
+//! only `SynAck` is marked as a burst head, and those frames are not heads —
+//! they never start a burst — so filling them would spend bytes with nothing to
+//! hide. They are rare enough not to carry a signature on their own.
 //!
 //! Two further properties keep the shaping from becoming a signature of its own:
 //!
@@ -68,8 +74,9 @@
 //! and the downlink is byte-for-byte what it was before this module existed.
 //!
 //! Nothing here touches the padding *scheme* string or its md5, so no client is
-//! asked to re-handshake, and the shaper allocates nothing per session, so the
-//! connection budget in `config_auto` keeps its meaning.
+//! asked to re-handshake, and the shaper allocates nothing per record — just
+//! one small counter struct per session — so the connection budget in
+//! `config_auto` keeps its meaning.
 
 use std::io;
 use std::sync::Arc;
@@ -406,6 +413,37 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
                 self.shaper.record_done(0);
             }
         }
+        Ok(())
+    }
+
+    /// If a record is currently being built, flush it so the next frame starts
+    /// a fresh record. The buffer may hold a partial frame (split is
+    /// frame-transparent), so this never pads — padding behind a partial frame
+    /// would desynchronise the peer's parser.
+    ///
+    /// Control frames call this first so they are never split across records:
+    /// a split control frame whose flush then times out leaves half a frame in
+    /// the buffer, and the next writer appends behind a truncated header,
+    /// corrupting the frame stream from there on.
+    pub async fn ensure_record_boundary(&mut self) -> io::Result<()> {
+        if self.shaper.pending() > 0 {
+            self.w.flush().await?;
+            self.shaper.record_done(0);
+        }
+        Ok(())
+    }
+
+    /// Write a whole frame in one go, never splitting it across records.
+    ///
+    /// Control frames use this instead of [`Self::write_all`]: a `write_all`
+    /// record cut can land inside the frame, and if the flush after the cut
+    /// times out the remainder is a truncated header the next writer appends
+    /// behind. Writing the frame atomically means a timed-out flush leaves a
+    /// *complete* frame in the buffer. Call [`Self::ensure_record_boundary`]
+    /// first so the frame also starts a fresh record.
+    pub async fn write_atomic(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.w.write_all(buf).await?;
+        self.shaper.account(buf.len());
         Ok(())
     }
 
@@ -868,6 +906,104 @@ mod tests {
             s.tail_padding(),
             0,
             "a head already above the band floor must not be padded"
+        );
+    }
+
+    /// True when every record boundary falls on a frame boundary.
+    ///
+    /// `sizes` are the per-record plaintext sizes in emission order, `bytes`
+    /// their concatenation (what `Recorder` records). A split control frame
+    /// leaves a truncated header at the end of one record; this is the failure
+    /// mode that corrupts the peer's frame parser when the flush after the cut
+    /// is cancelled.
+    fn is_frame_aligned(sizes: &[usize], bytes: &[u8]) -> bool {
+        let mut offset = 0;
+        for &size in sizes {
+            let end = offset + size;
+            let mut i = offset;
+            while i < end {
+                if i + HEADER_SIZE > end {
+                    return false; // header truncated at the record boundary
+                }
+                let mut hdr = [0u8; HEADER_SIZE];
+                hdr.copy_from_slice(&bytes[i..i + HEADER_SIZE]);
+                let f = FrameHeader::decode(&hdr);
+                let frame_end = i + HEADER_SIZE + f.length as usize;
+                if frame_end > end {
+                    return false; // payload crosses the record boundary
+                }
+                i = frame_end;
+            }
+            offset = end;
+        }
+        offset == bytes.len()
+    }
+
+    #[tokio::test]
+    async fn test_control_frame_never_straddles_a_record() {
+        // Regression: control frames used to go through `write_all`, the data
+        // path, which cuts at the shaper's target. A SynAck landing exactly at
+        // the budget edge was split into 3+4 bytes across two records — the
+        // trailing 4 bytes became a bare tiny record (the very giveaway the
+        // feature exists to remove), and a cancelled flush after the cut left a
+        // truncated header in the buffer that the next writer appended behind,
+        // corrupting the frame stream from there on.
+        let (mut ws, log) = enabled_setup();
+
+        // Leave the current record 3 bytes short of its target: exactly one
+        // 7-byte SynAck fits before the budget runs dry, so the old path was
+        // *guaranteed* to split the frame. The data itself is a non-head frame.
+        let target = ws.shaper().target;
+        assert!(
+            target >= HEADER_SIZE + 3 + HEADER_SIZE,
+            "target {target} too small for a split-proof frame"
+        );
+        ws.write_all(&frame(Command::Psh, 1, target - HEADER_SIZE - 3))
+            .await
+            .unwrap();
+        assert_eq!(ws.shaper().pending(), target - 3);
+
+        // The control-frame sequence: close the pending record first (the
+        // buffer now holds only complete frames), then write the SynAck
+        // atomically so it starts its own fresh record.
+        ws.ensure_record_boundary().await.unwrap();
+        ws.shaper_mut().mark_burst_head();
+        let syn_ack = frame(Command::SynAck, 7, 0);
+        ws.write_atomic(&syn_ack).await.unwrap();
+        ws.flush().await.unwrap();
+
+        let sizes = log.sizes();
+        let stream = log.stream();
+        assert!(
+            is_frame_aligned(&sizes, &stream),
+            "a record boundary cuts through a frame: records {sizes:?}"
+        );
+
+        // The pending data record was flushed whole, and the SynAck started a
+        // fresh record that got filled up into the head band — it must not come
+        // out as a bare 7-byte tail.
+        assert_eq!(sizes.len(), 2, "records: {sizes:?}");
+        assert_eq!(sizes[0], target - 3, "data record must flush un-split");
+        assert!(
+            head_band().contains(&sizes[1]),
+            "SynAck record {} outside the fill band",
+            sizes[1]
+        );
+
+        // And the frame stream reads back exactly: Psh(data), SynAck, then the
+        // Waste frame that filled the head.
+        let frames = parse_frames(&stream);
+        let real: Vec<_> = frames
+            .iter()
+            .filter(|(c, _)| *c != Command::Waste)
+            .cloned()
+            .collect();
+        assert_eq!(
+            real,
+            vec![
+                (Command::Psh, target - HEADER_SIZE - 3),
+                (Command::SynAck, 0),
+            ]
         );
     }
 

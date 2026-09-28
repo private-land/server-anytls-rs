@@ -104,7 +104,12 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_ANYTLS_ACL_CONF_FILE")]
     pub acl_conf_file: Option<PathBuf>,
 
-    #[arg(long, env = "X_PANDA_ANYTLS_BLOCK_PRIVATE_IP", default_value_t = true)]
+    #[arg(
+        long,
+        env = "X_PANDA_ANYTLS_BLOCK_PRIVATE_IP",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
     pub block_private_ip: bool,
 
     #[arg(long, env = "X_PANDA_ANYTLS_REFRESH_GEODATA", default_value_t = false)]
@@ -140,7 +145,12 @@ pub struct CliArgs {
         long,
         env = "X_PANDA_ANYTLS_DOWNLINK_PADDING",
         default_value_t = true,
-        help_heading = "Performance"
+        help_heading = "Performance",
+        // `default_value_t = true` on its own makes clap infer a SetTrue switch,
+        // which rejects `--downlink_padding false` *and* `--downlink_padding=false`
+        // with UnknownArgument — a flag that can only be turned on from the CLI
+        // is useless as a control. ArgAction::Set makes both spellings parse.
+        action = clap::ArgAction::Set
     )]
     pub downlink_padding: bool,
 
@@ -315,6 +325,51 @@ mod tests {
         cli.ca_file = Some("/path/to/ca.crt".to_string());
         assert!(cli.validate().is_ok());
         assert_eq!(cli.ca_file.unwrap(), "/path/to/ca.crt");
+    }
+
+    #[test]
+    fn test_cli_bool_flags_accept_explicit_false() {
+        // Regression: `default_value_t = true` without an explicit action makes
+        // clap infer a SetTrue switch, and both `--flag false` and
+        // `--flag=false` then die with UnknownArgument — the operator can only
+        // turn the feature on, never off, from the CLI. ArgAction::Set must
+        // make every spelling parse.
+        for args in [
+            vec!["--downlink_padding", "false"],
+            vec!["--downlink_padding=false"],
+        ] {
+            let mut full = vec!["anytls", "--node", "1"];
+            full.extend_from_slice(&args);
+            let cli = CliArgs::try_parse_from(full)
+                .unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            assert!(!cli.downlink_padding, "{args:?} must turn the flag off");
+        }
+        for args in [
+            vec!["--block_private_ip", "false"],
+            vec!["--block_private_ip=false"],
+        ] {
+            let mut full = vec!["anytls", "--node", "1"];
+            full.extend_from_slice(&args);
+            let cli = CliArgs::try_parse_from(full)
+                .unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            assert!(!cli.block_private_ip, "{args:?} must turn the flag off");
+        }
+
+        // The positive spellings must keep working. Note `ArgAction::Set`
+        // requires the value, so the bare `--downlink_padding` spelling is
+        // intentionally gone — it could only ever turn the flag *on*, which is
+        // the default anyway; the whole point of the explicit value is to let
+        // an operator turn it *off*.
+        for args in [
+            vec!["--downlink_padding", "true"],
+            vec!["--downlink_padding=true"],
+        ] {
+            let mut full = vec!["anytls", "--node", "1"];
+            full.extend_from_slice(&args);
+            let cli = CliArgs::try_parse_from(full)
+                .unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            assert!(cli.downlink_padding, "{args:?} must keep the flag on");
+        }
     }
 
     #[test]
