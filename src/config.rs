@@ -135,8 +135,7 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_ANYTLS_WRITE_BUF_SIZE", default_value_t = 32 * 1024, help_heading = "Performance")]
     pub write_buf_size: usize,
 
-    /// Server-side downlink padding ("补包"): shape downlink record sizes so
-    /// the TLS record-length sequence carries no TLS-in-TLS signature.
+    /// Server-side downlink shaping to reduce TLS-in-TLS length correlations.
     ///
     /// Only applies to clients announcing protocol v2; legacy clients are
     /// byte-for-byte unaffected. Disable to fall back to the unshaped write
@@ -153,6 +152,17 @@ pub struct CliArgs {
         action = clap::ArgAction::Set
     )]
     pub downlink_padding: bool,
+
+    /// Experimental early downlink padding, bounded to 2 KiB / 8 records / 3s
+    /// after each successful SynAck. Requires downlink_padding and protocol v2.
+    #[arg(
+        long,
+        env = "X_PANDA_ANYTLS_DOWNLINK_BURST_PADDING",
+        default_value_t = true,
+        help_heading = "Performance",
+        action = clap::ArgAction::Set
+    )]
+    pub downlink_burst_padding: bool,
 
     /// Per-stream data channel capacity (number of buffered messages).
     #[arg(
@@ -252,6 +262,7 @@ mod tests {
             ca_file: None,
             write_buf_size: 32 * 1024,
             downlink_padding: true,
+            downlink_burst_padding: true,
             stream_channel_capacity: 128,
         }
     }
@@ -428,7 +439,26 @@ mod tests {
         let cli = create_test_cli_args();
         assert_eq!(cli.write_buf_size, 32 * 1024);
         assert!(cli.downlink_padding);
+        assert!(cli.downlink_burst_padding);
         assert_eq!(cli.stream_channel_capacity, 128);
+    }
+
+    #[test]
+    fn test_cli_burst_padding_accepts_explicit_values() {
+        let defaults = CliArgs::try_parse_from(["anytls", "--node", "1"]).unwrap();
+        assert!(defaults.downlink_burst_padding);
+        for enabled in [false, true] {
+            let value = enabled.to_string();
+            let cli = CliArgs::try_parse_from([
+                "anytls",
+                "--node",
+                "1",
+                "--downlink_burst_padding",
+                &value,
+            ])
+            .unwrap();
+            assert_eq!(cli.downlink_burst_padding, enabled);
+        }
     }
 
     #[test]
