@@ -121,6 +121,8 @@ pub struct SessionConfig {
     /// protocol v2, so legacy clients keep the exact wire behaviour they had
     /// before this existed. See [`crate::core::downlink_padding`].
     pub downlink_padding: bool,
+    /// Bounded padding after successful SynAck; enabled by default for v2.
+    pub downlink_burst_padding: bool,
 }
 
 impl Default for SessionConfig {
@@ -131,6 +133,7 @@ impl Default for SessionConfig {
             write_buf_size: DEFAULT_WRITE_BUF_SIZE,
             stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
             downlink_padding: true,
+            downlink_burst_padding: true,
         }
     }
 }
@@ -152,7 +155,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let (read_half, write_half) = tokio::io::split(conn);
         let buf_size = config.write_buf_size;
         let downlink_padding = config.downlink_padding;
-        let write_state = WriteState::new(write_half, buf_size, downlink_padding);
+        let mut write_state = WriteState::new(write_half, buf_size, downlink_padding);
+        write_state
+            .shaper_mut()
+            .configure_burst_padding(config.downlink_burst_padding);
         // Clone the shaper's counters out of the write state so the session
         // can report them at close without taking the write lock.
         let shaping_counters = write_state.shaper().counters().clone();
@@ -489,6 +495,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             }
             // Flush immediately so control frames are not delayed in the buffer.
             w.flush().await?;
+            if command == Command::SynAck && data.is_empty() {
+                w.shaper_mut().start_burst_padding();
+            }
             Ok(())
         })
         .await

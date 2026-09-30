@@ -15,9 +15,7 @@
 //! Two properties of that sequence are the signature:
 //!
 //! 1. a handful of tiny records (24–165 B) carries the per-connection control
-//!    frames — a 28-byte record is a marker no real server emits at the head of
-//!    a connection, and anytls emits one (`SynAck`) for *every* proxied
-//!    connection,
+//!    frames, including a small `SynAck` for every v2 proxied connection,
 //! 2. the records that follow mirror the *inner* TLS records one-for-one, so
 //!    the outer lengths match the inner handshake/`16 KiB` record lengths.
 //!
@@ -28,9 +26,9 @@
 //!
 //! # How the shaping works
 //!
-//! A `BufWriter` flush is what turns buffered plaintext into a TLS record: one
-//! `flush()` == one record. Shaping therefore means deciding how many plaintext
-//! bytes go into each flush, which is all this module does:
+//! A `BufWriter` flush hands a bounded plaintext write to TLS. Actual TLS
+//! record sizes also depend on the TLS writer and must be measured on the
+//! encrypted stream. Shaping decides how many bytes go into each flush:
 //!
 //! * **split** — a record larger than [`SPLIT_MAX`] is cut into several records
 //!   of a randomised size inside `[SPLIT_MIN, SPLIT_MAX]`. Each cut costs an
@@ -45,15 +43,12 @@
 //!   lifts a 7-byte `SynAck` to a record size that reads like a handshake
 //!   fragment.
 //!
-//! Everything else is left alone. In particular a *tail* record (the last
-//! partial record of a data flush) is **not** padded: real TLS servers end a
-//! burst with whatever is left over, and padding every small flush would turn a
-//! chatty client's one-line responses into 1 KB records for no gain.
-//!
-//! `HeartResponse`, `Fin` and `Alert` also stay bare 7-byte-payload records:
-//! only `SynAck` is marked as a burst head, and those frames are not heads —
-//! they never start a burst — so filling them would spend bytes with nothing to
-//! hide. They are rare enough not to carry a signature on their own.
+//! The split/head-fill policy alone leaves data tails and other control frames
+//! unpadded, preserving some short inner-handshake/HTTP-response lengths. The
+//! early-window policy, enabled by default by the server, fills tails after
+//! successful `SynAck`, bounded by time, record count, and additional bytes.
+//! Larger tails also get random extra bytes to change burst totals. It neither
+//! delays writes deliberately nor removes directional/timing correlations.
 //!
 //! Two further properties keep the shaping from becoming a signature of its own:
 //!
@@ -81,8 +76,10 @@
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::time::Instant;
 
 use crate::core::frame::{Command, FrameHeader, HEADER_SIZE};
 
@@ -110,6 +107,13 @@ pub const SPLIT_MIN: usize = 1024;
 /// records, and keeping every record under the band top breaks that
 /// correspondence.
 pub const SPLIT_MAX: usize = 2560;
+
+/// Additional padding budget for one early downlink window, excluding the
+/// existing Settings/SynAck head fill and TLS framing overhead.
+pub const BURST_PADDING_BUDGET: usize = 2048;
+const BURST_RECORD_LIMIT: usize = 8;
+const BURST_DURATION: Duration = Duration::from_secs(3);
+const BURST_HEAD_MAX: usize = 768;
 
 /// A `Waste` frame is `HEADER_SIZE` bytes of header plus a payload; the
 /// smallest useful one is a bare header.
@@ -186,6 +190,10 @@ pub struct DownlinkShaper {
     split_max: usize,
     rng: u64,
     counters: Arc<ShapingCounters>,
+    burst_configured: bool,
+    burst_deadline: Option<Instant>,
+    burst_budget: usize,
+    burst_records: usize,
 }
 
 impl DownlinkShaper {
@@ -215,6 +223,10 @@ impl DownlinkShaper {
             split_max,
             rng,
             counters: Arc::new(ShapingCounters::default()),
+            burst_configured: false,
+            burst_deadline: None,
+            burst_budget: 0,
+            burst_records: 0,
         };
         shaper.pick_target();
         shaper
@@ -235,6 +247,35 @@ impl DownlinkShaper {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Optional early-window padding, still gated by the main flag and v2.
+    pub fn configure_burst_padding(&mut self, enabled: bool) {
+        self.burst_configured = enabled;
+        if !enabled {
+            self.burst_deadline = None;
+        }
+    }
+
+    /// Re-arm only after a successful SynAck has been flushed. Windows belong
+    /// to the outer session, so overlapping streams share (rather than add)
+    /// this budget. No per-stream allocation or timer task is needed.
+    pub fn start_burst_padding(&mut self) {
+        if self.enabled && self.burst_configured {
+            self.burst_deadline = Some(Instant::now() + BURST_DURATION);
+            self.burst_budget = BURST_PADDING_BUDGET;
+            self.burst_records = BURST_RECORD_LIMIT;
+        }
+    }
+
+    fn burst_active(&self) -> bool {
+        self.enabled
+            && self.burst_configured
+            && self.burst_records > 0
+            && self.burst_budget >= MIN_WASTE_FRAME
+            && self
+                .burst_deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     pub fn counters(&self) -> &Arc<ShapingCounters> {
@@ -280,6 +321,41 @@ impl DownlinkShaper {
         self.target
             .saturating_sub(self.pending)
             .clamp(MIN_WASTE_FRAME, cap)
+    }
+
+    /// Called only at a complete frame boundary. Small records get a random
+    /// floor; larger tails get random additional bytes, changing burst totals
+    /// as well as record boundaries. Mid-frame split flushes never use this.
+    fn padding_for_flush(&mut self) -> usize {
+        let head_pad = self.tail_padding();
+        if head_pad > 0 || !self.burst_active() || self.pending == 0 {
+            return head_pad;
+        }
+        let capacity = self
+            .split_max
+            .saturating_sub(self.pending)
+            .min(self.burst_budget);
+        if capacity < MIN_WASTE_FRAME {
+            return 0;
+        }
+        let wanted = if self.pending < self.head_min {
+            self.range(self.head_min, BURST_HEAD_MAX.min(self.head_max)) - self.pending
+        } else {
+            self.range(32, 256)
+        };
+        let pad = wanted.clamp(MIN_WASTE_FRAME, capacity);
+        // Reserve before any I/O await. A failed/cancelled flush must not
+        // spend the same additional-byte budget again on a later retry.
+        self.burst_budget -= pad;
+        pad
+    }
+
+    fn reserve_record_flush(&mut self) {
+        if self.pending > 0 {
+            // Count attempts conservatively: bytes may have reached the peer
+            // even if the underlying flush subsequently fails or is cancelled.
+            self.burst_records = self.burst_records.saturating_sub(1);
+        }
     }
 
     /// Mark the next record as a burst head: the session start, or a `SynAck`
@@ -409,6 +485,7 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
             self.w.write_all(&rest[..n]).await?;
             rest = &rest[n..];
             if self.shaper.account(n) {
+                self.shaper.reserve_record_flush();
                 self.w.flush().await?;
                 self.shaper.record_done(0);
             }
@@ -427,6 +504,7 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
     /// corrupting the frame stream from there on.
     pub async fn ensure_record_boundary(&mut self) -> io::Result<()> {
         if self.shaper.pending() > 0 {
+            self.shaper.reserve_record_flush();
             self.w.flush().await?;
             self.shaper.record_done(0);
         }
@@ -447,10 +525,11 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
         Ok(())
     }
 
-    /// Flush buffered bytes as one record, filling a burst head up into the band
-    /// first so that the head is not a 28-byte giveaway.
+    /// Flush at a complete frame boundary, applying head fill or the optional
+    /// bounded early-window fill. Never call this with a partial frame pending.
     pub async fn flush(&mut self) -> io::Result<()> {
-        let pad = self.shaper.tail_padding();
+        let pad = self.shaper.padding_for_flush();
+        self.shaper.reserve_record_flush();
         if pad > 0 {
             write_waste(&mut self.w, pad).await?;
             self.shaper.account(pad);
@@ -772,6 +851,199 @@ mod tests {
         let sizes = log.sizes();
         assert_eq!(sizes[before], HEADER_SIZE + 40);
         assert_eq!(ws.shaper().counters().snapshot().padded, 0);
+    }
+
+    async fn burst_setup() -> (WriteState<Recorder>, Log) {
+        let (mut ws, log) = enabled_setup();
+        ws.shaper = DownlinkShaper::with_seed(true, CAP, 42);
+        ws.shaper.enable();
+        ws.write_all(&frame(Command::ServerSettings, 0, 3))
+            .await
+            .unwrap();
+        ws.flush().await.unwrap();
+        ws.shaper_mut().configure_burst_padding(true);
+        ws.shaper_mut().start_burst_padding();
+        (ws, log)
+    }
+
+    #[tokio::test]
+    async fn test_burst_padding_bounds_cost_and_restores_small_tails() {
+        let (mut ws, log) = burst_setup().await;
+        let before = ws.shaper().counters().snapshot().padded;
+        let first = log.sizes().len();
+        for _ in 0..20 {
+            ws.write_all(&frame(Command::Psh, 1, 40)).await.unwrap();
+            ws.flush().await.unwrap();
+        }
+        let sizes = log.sizes();
+        assert!(
+            sizes[first] >= HEAD_MIN,
+            "first small response must be filled"
+        );
+        assert!(sizes[first + 8..].iter().all(|&n| n == 47));
+        let spent = ws.shaper().counters().snapshot().padded - before;
+        assert!(
+            spent > 0 && spent <= 2048,
+            "additional padding spent {spent}"
+        );
+        assert_eq!(
+            parse_frames(&log.stream())
+                .iter()
+                .filter(|(cmd, _)| *cmd == Command::Psh)
+                .count(),
+            20
+        );
+    }
+
+    #[tokio::test]
+    async fn test_burst_padding_changes_medium_response_total() {
+        let (mut ws, log) = burst_setup().await;
+        let first = log.sizes().len();
+        ws.write_all(&frame(Command::Psh, 1, 600)).await.unwrap();
+        ws.flush().await.unwrap();
+        let sizes = log.sizes();
+        assert!(
+            sizes[first] > 607,
+            "splitting alone leaves the burst total unchanged"
+        );
+        assert!(sizes[first] <= 607 + 256);
+        parse_frames(&log.stream());
+    }
+
+    #[tokio::test]
+    async fn test_burst_record_limit_is_independent_of_byte_budget() {
+        let (mut ws, log) = burst_setup().await;
+        let first = log.sizes().len();
+        for _ in 0..8 {
+            ws.write_all(&frame(Command::Psh, 1, 600)).await.unwrap();
+            ws.flush().await.unwrap();
+        }
+        assert!(
+            ws.shaper.burst_budget >= 256,
+            "fixture must leave enough budget for a ninth fill"
+        );
+        assert!(log.sizes()[first..].iter().all(|&n| n > 607));
+        ws.write_all(&frame(Command::Psh, 1, 600)).await.unwrap();
+        ws.flush().await.unwrap();
+        assert_eq!(log.sizes()[first + 8], 607);
+        parse_frames(&log.stream());
+    }
+
+    #[tokio::test]
+    async fn test_mid_frame_splits_consume_burst_record_limit() {
+        let (mut ws, log) = burst_setup().await;
+        ws.write_all(&frame(Command::Psh, 1, 32_000)).await.unwrap();
+        ws.flush().await.unwrap();
+        let first = log.sizes().len();
+        ws.write_all(&frame(Command::Psh, 1, 40)).await.unwrap();
+        ws.flush().await.unwrap();
+        assert_eq!(log.sizes()[first], 47);
+        assert_eq!(
+            ws.shaper.burst_budget, 2048,
+            "splits must exhaust records without spending fill budget"
+        );
+        parse_frames(&log.stream());
+    }
+
+    #[tokio::test]
+    async fn test_burst_padding_expires_and_rearms_for_reused_session() {
+        let (mut ws, log) = burst_setup().await;
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+        let first = log.sizes().len();
+        ws.write_all(&frame(Command::Psh, 1, 40)).await.unwrap();
+        ws.flush().await.unwrap();
+        assert_eq!(log.sizes()[first], 47);
+        ws.shaper_mut().start_burst_padding();
+        ws.write_all(&frame(Command::Psh, 3, 40)).await.unwrap();
+        ws.flush().await.unwrap();
+        assert!(log.sizes()[first + 1] >= HEAD_MIN);
+    }
+
+    #[tokio::test]
+    async fn test_burst_padding_cannot_enable_legacy_or_disabled_shaping() {
+        for main_flag in [false, true] {
+            let (mut ws, log) = setup(main_flag);
+            ws.shaper_mut().configure_burst_padding(true);
+            if !main_flag {
+                ws.shaper_mut().enable();
+            }
+            ws.shaper_mut().start_burst_padding();
+            ws.write_all(&frame(Command::Psh, 1, 40)).await.unwrap();
+            ws.flush().await.unwrap();
+            assert_eq!(log.sizes(), vec![47]);
+            assert_eq!(ws.shaper().counters().snapshot().padded, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_burst_padding_keeps_split_frames_parseable() {
+        let (mut ws, log) = burst_setup().await;
+        ws.write_all(&frame(Command::Psh, 1, 6000)).await.unwrap();
+        ws.flush().await.unwrap();
+        let frames = parse_frames(&log.stream());
+        assert!(frames.contains(&(Command::Psh, 6000)));
+        assert!(frames.iter().any(|(command, _)| *command == Command::Waste));
+        assert!(log.sizes().iter().all(|&n| n <= 2560));
+    }
+
+    #[tokio::test]
+    async fn test_burst_padding_budget_survives_failed_flush_retries() {
+        struct FailingFlush {
+            recorder: Recorder,
+            fail: bool,
+        }
+        impl AsyncWrite for FailingFlush {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.recorder).poll_write(cx, buf)
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                if self.fail {
+                    Poll::Ready(Err(io::Error::other("flush failed after write")))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let log = Log::default();
+        let mut ws = WriteState::new(
+            FailingFlush {
+                recorder: Recorder { log: log.clone() },
+                fail: false,
+            },
+            CAP,
+            true,
+        );
+        ws.shaper_mut().enable();
+        ws.write_all(&frame(Command::ServerSettings, 0, 3))
+            .await
+            .unwrap();
+        ws.flush().await.unwrap();
+        let before = log.stream().len();
+        let before_records = log.sizes().len();
+        ws.shaper_mut().configure_burst_padding(true);
+        ws.shaper_mut().start_burst_padding();
+        ws.w.get_mut().fail = true;
+        ws.write_all(&frame(Command::Psh, 1, 40)).await.unwrap();
+        for _ in 0..64 {
+            assert!(ws.flush().await.is_err());
+        }
+        let actual_padding = log.stream().len() - before - 47;
+        assert!(
+            actual_padding <= 2048,
+            "failed flush retries reused the budget: {actual_padding} bytes"
+        );
+        assert!(
+            log.sizes().len() - before_records <= 8,
+            "failed flush retries reused the record budget"
+        );
+        parse_frames(&log.stream());
     }
 
     #[tokio::test]
