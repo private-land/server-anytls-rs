@@ -83,6 +83,7 @@ async fn https_probe(
     version: u8,
     matched: bool,
     enabled: bool,
+    exhaust_window: bool,
 ) -> Vec<usize> {
     let (backend_tls, backend_client_tls) = tls_configs();
     let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -221,6 +222,23 @@ async fn https_probe(
             }
         }
     }
+    if exhaust_window {
+        assert_eq!(version, 2);
+        for _ in 0..8 {
+            outer
+                .write_all(&frame(Command::HeartRequest, 0, &[]))
+                .await
+                .unwrap();
+            outer.flush().await.unwrap();
+            loop {
+                let (header, _) = read_frame(&mut outer).await;
+                if header.command == Command::HeartResponse {
+                    break;
+                }
+                assert_eq!(header.command, Command::Waste);
+            }
+        }
+    }
     captured.lock().unwrap().clear();
 
     // Bridge the AnyTLS stream into a byte stream usable by a second real TLS
@@ -279,9 +297,12 @@ async fn https_probe(
 
 #[tokio::test]
 async fn test_https_204_early_downlink_records_are_padded() {
-    let lengths = tokio::time::timeout(Duration::from_secs(10), https_probe(None, 2, true, true))
-        .await
-        .unwrap();
+    let lengths = tokio::time::timeout(
+        Duration::from_secs(10),
+        https_probe(None, 2, true, true, false),
+    )
+    .await
+    .unwrap();
     println!("early padding enabled, encrypted TLS record lengths: {lengths:?}");
     assert!(
         lengths.len() >= 2,
@@ -297,7 +318,7 @@ async fn test_https_204_early_downlink_records_are_padded() {
 async fn test_https_204_control_keeps_short_record() {
     let lengths = tokio::time::timeout(
         Duration::from_secs(10),
-        https_probe(Some(false), 2, true, true),
+        https_probe(Some(false), 2, true, true, false),
     )
     .await
     .unwrap();
@@ -311,10 +332,12 @@ async fn test_https_204_control_keeps_short_record() {
 #[tokio::test]
 async fn test_v1_https_204_downlink_is_padded_with_matching_or_updated_scheme() {
     for matched in [true, false] {
-        let lengths =
-            tokio::time::timeout(Duration::from_secs(10), https_probe(None, 1, matched, true))
-                .await
-                .unwrap();
+        let lengths = tokio::time::timeout(
+            Duration::from_secs(10),
+            https_probe(None, 1, matched, true, false),
+        )
+        .await
+        .unwrap();
         println!("v1 matched={matched}, encrypted TLS record lengths: {lengths:?}");
         assert!(lengths.len() >= 2);
         assert!(
@@ -326,11 +349,48 @@ async fn test_v1_https_204_downlink_is_padded_with_matching_or_updated_scheme() 
 
 #[tokio::test]
 async fn test_v1_https_204_padding_off_preserves_short_record() {
-    let lengths = tokio::time::timeout(Duration::from_secs(10), https_probe(None, 1, true, false))
-        .await
-        .unwrap();
+    let lengths = tokio::time::timeout(
+        Duration::from_secs(10),
+        https_probe(None, 1, true, false, false),
+    )
+    .await
+    .unwrap();
     assert!(
         lengths.iter().any(|&n| n < 160),
         "off switch did not preserve short response: {lengths:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_v2_https_after_window_keeps_unpadded_data_records() {
+    let lengths = tokio::time::timeout(
+        Duration::from_secs(10),
+        https_probe(None, 2, true, true, true),
+    )
+    .await
+    .unwrap();
+    println!("v2 exhausted session window, encrypted TLS records: {lengths:?}");
+    assert!(
+        lengths.iter().any(|&n| n < 160),
+        "late data was still padded: {lengths:?}"
+    );
+    assert!(
+        lengths.iter().any(|&n| n > 1000),
+        "late TLS handshake still fragmented into early targets: {lengths:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_v2_https_updated_padding_scheme_remains_compatible() {
+    let lengths = tokio::time::timeout(
+        Duration::from_secs(10),
+        https_probe(None, 2, false, true, false),
+    )
+    .await
+    .unwrap();
+    assert!(lengths.len() >= 2);
+    assert!(
+        lengths.iter().all(|&n| n >= 500 + 17),
+        "early response was not filled: {lengths:?}"
     );
 }

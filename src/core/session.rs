@@ -72,7 +72,7 @@ async fn write_cmd_frame<W: AsyncWrite + Unpin>(
         };
         let mut hdr_buf = [0u8; HEADER_SIZE];
         header.encode(&mut hdr_buf);
-        w.write_all(&hdr_buf).await?;
+        w.write_fin(&hdr_buf).await?;
     }
     Ok(())
 }
@@ -483,7 +483,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             // the first bytes the peer sees for that stream, and the smallest
             // record in it. Flag it as a head so the shaper fills it up into
             // the head band instead of emitting a bare 28-byte record. No-op
-            // unless shaping is enabled (i.e. the peer announced v2).
+            // for the legacy policy; v2 never re-arms its session window.
             if command == Command::SynAck {
                 w.shaper_mut().mark_burst_head();
             }
@@ -501,6 +501,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 w.write_atomic(&buf).await?;
             }
             // Flush immediately so control frames are not delayed in the buffer.
+            if command != Command::Psh {
+                w.append_control_padding().await?;
+            }
             w.flush().await?;
             if command == Command::SynAck && data.is_empty() {
                 w.shaper_mut().start_burst_padding();
@@ -571,17 +574,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             .await
             .map_err(|_| crate::error::Error::WriteTimeout)?;
         timed_write(async {
-            // This response is the session's first downlink write, so it is the
-            // burst head the shaper exists to fix: without shaping it is a
-            // ~40-byte record, which real servers never emit at the head of a
-            // connection. Enable shaping here rather than in the recv loop so
-            // that the switch and the first shaped record happen under the same
-            // lock — a legacy peer never reaches this point with v2 announced.
+            // Select the v2 session policy under the shared write lock before
+            // the first response. Repeated Settings never replenish its budget.
             if self.peer_version.load(Ordering::Relaxed) >= 2 {
-                w.shaper_mut().enable();
-                w.shaper_mut().mark_burst_head();
+                w.shaper_mut().enable_v2();
+                w.ensure_record_boundary().await?;
+                w.write_atomic(&buf).await?;
+                w.append_control_padding().await?;
+            } else {
+                w.write_all(&buf).await?;
             }
-            w.write_all(&buf).await?;
             w.flush().await?;
             Ok(())
         })
@@ -643,6 +645,52 @@ mod tests {
         if !data.is_empty() {
             w.write_all(data).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_v2_session_window_pads_heartbeats_and_does_not_rearm() {
+        let (mut client, server) = duplex(65536);
+        let session = Arc::new(Session::new_server(
+            server,
+            test_padding(),
+            SessionConfig::default(),
+        ));
+        let settings = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(&mut client, Command::Settings, 0, settings.as_bytes()).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let sess = session.clone();
+        let task = tokio::spawn(async move { sess.recv_loop(tx, CancellationToken::new()).await });
+        // Read exactly the first completed write; the parser must accept all frames.
+        let mut first = vec![0; 4096];
+        let n = client.read(&mut first).await.unwrap();
+        assert!((500..=1000).contains(&n), "initial settings size {n}");
+        for reply in 1..=9 {
+            session
+                .write_frame(Command::HeartResponse, 0, &[])
+                .await
+                .unwrap();
+            let n = client.read(&mut first).await.unwrap();
+            if reply < 8 {
+                assert!((500..=1000).contains(&n), "early heartbeat {reply}: {n}");
+            } else {
+                assert_eq!(
+                    n, 17,
+                    "late control must carry only a ten-byte Waste suffix"
+                );
+            }
+        }
+        for sid in [1, 3, 5] {
+            session.handshake_success(sid).await.unwrap();
+            let n = client.read(&mut first).await.unwrap();
+            assert_eq!(n, 17, "reused stream replenished padding");
+        }
+        // Repeated settings must not replenish the window either.
+        session.write_settings_response(false, true).await.unwrap();
+        let n = client.read(&mut first).await.unwrap();
+        assert_eq!(n, 20);
+        assert!(session.shaping_stats().padded <= 8192 + 14 * 10);
+        drop(client);
+        let _ = task.await;
     }
 
     #[tokio::test]
@@ -1148,17 +1196,18 @@ mod tests {
             "Waste payload must be zero-filled"
         );
 
-        // 3) The whole head record lands inside the head band. 320/1400 are
-        //    literals on purpose: reading them off HEAD_MIN/HEAD_MAX would make
-        //    this test tautological.
-        let pad_bytes = HEADER_SIZE + waste_payload;
-        let total = settings_frame.len() + pad_bytes;
+        assert_eq!(waste_payload, 3, "v2 control suffix payload");
+        client_io.read_exact(&mut waste_hdr).await.unwrap();
+        let fill = FrameHeader::decode(&waste_hdr);
+        assert_eq!(fill.command, Command::Waste);
+        let mut fill_body = vec![0; fill.length as usize];
+        client_io.read_exact(&mut fill_body).await.unwrap();
+        let total =
+            settings_frame.len() + HEADER_SIZE + waste_payload + HEADER_SIZE + fill_body.len();
         assert!(
-            (320..=1400).contains(&total),
-            "padded head record should be 320..=1400 bytes, got {total} \
-             (10 real + {pad_bytes} padding)"
+            (500..=1000).contains(&total),
+            "v2 early record size {total}"
         );
-        assert_stream_quiet(&mut client_io, 200).await;
 
         drop(client_io);
         let _ = handle.await;

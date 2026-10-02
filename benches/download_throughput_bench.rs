@@ -1,11 +1,11 @@
-//! RED/GREEN benchmark: download-direction throughput (remote → client).
+//! Download-direction throughput (remote → client).
 //!
 //! Uses real TLS connections (localhost) to capture TLS record overhead
 //! from the writer task's flush pattern.
 //!
-//! The Go version achieves ~108 Mbps while Rust only ~6 Mbps on the same node.
-//! This bench isolates the bottleneck by measuring throughput of data flowing
-//! from "remote" back through the session to the "client" over actual TLS.
+//! Waits until the client has parsed all payload bytes before ending a sample.
+//! This prevents writer cancellation from making an incomplete transfer appear
+//! faster than an end-to-end download.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use rcgen::generate_simple_self_signed;
@@ -73,7 +73,7 @@ fn bench_download_throughput(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(TOTAL_BYTES as u64));
     group.sample_size(10);
 
-    for &buf_size in &[65536_usize, 262144] {
+    for &buf_size in &[32768_usize, 65536, 262144] {
         group.bench_function(format!("buf_{}k", buf_size / 1024), |b| {
             let server_cfg = server_tls_config.clone();
             let client_cfg = client_tls_config.clone();
@@ -86,6 +86,8 @@ fn bench_download_throughput(c: &mut Criterion) {
                     let acceptor = TlsAcceptor::from(server_cfg.clone());
                     let connector = TlsConnector::from(client_cfg.clone());
                     let md5_clone = md5.clone();
+
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
                     // Server side
                     let server_handle = tokio::spawn(async move {
@@ -142,6 +144,7 @@ fn bench_download_throughput(c: &mut Criterion) {
                         assert_eq!(copied, TOTAL_BYTES as u64);
 
                         feeder.await.unwrap();
+                        done_rx.await.unwrap();
                         cancel.cancel();
                         recv_handle.abort();
                         let _ = recv_handle.await;
@@ -160,14 +163,27 @@ fn bench_download_throughput(c: &mut Criterion) {
                         write_frame(&mut tls, Command::Syn, 1, &[]).await;
                         tls.flush().await.unwrap();
 
-                        // Drain all received data
-                        let mut buf = vec![0u8; 256 * 1024];
-                        loop {
-                            match tls.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(_) => {}
+                        // Validate complete payload delivery, discarding legal Waste.
+                        let mut received = 0;
+                        let mut payload = vec![0u8; u16::MAX as usize];
+                        while received < TOTAL_BYTES {
+                            let mut hdr = [0; HEADER_SIZE];
+                            tls.read_exact(&mut hdr).await.unwrap();
+                            let frame = FrameHeader::decode(&hdr);
+                            let n = frame.length as usize;
+                            tls.read_exact(&mut payload[..n]).await.unwrap();
+                            match frame.command {
+                                Command::Psh => {
+                                    assert_eq!(frame.stream_id, 1);
+                                    assert!(payload[..n].iter().all(|&b| b == 0xAB));
+                                    received += n;
+                                }
+                                Command::Waste | Command::ServerSettings => {}
+                                command => panic!("unexpected frame {command:?}"),
                             }
                         }
+                        assert_eq!(received, TOTAL_BYTES);
+                        done_tx.send(()).unwrap();
                     });
 
                     server_handle.await.unwrap();

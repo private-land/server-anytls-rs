@@ -152,8 +152,9 @@ pub struct CliArgs {
     )]
     pub downlink_padding: bool,
 
-    /// Experimental early downlink padding, bounded to 2 KiB / 8 records / 3s
-    /// after each successful outbound connection. Requires downlink_padding.
+    /// Early downlink padding. v2 shares one non-renewable window of 8 flush
+    /// attempts / 8 KiB per session; v1 retains 2 KiB / 8 records / 3s after
+    /// each outbound connection. Requires downlink_padding.
     #[arg(
         long,
         env = "X_PANDA_ANYTLS_DOWNLINK_BURST_PADDING",

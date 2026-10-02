@@ -56,22 +56,28 @@ All arguments support environment variables with `X_PANDA_ANYTLS_` prefix.
 | `--max_connections` | `auto` | Global connection limit. `auto` derives a cap from `min(cpu_throughput, ram_budget, fd_limit)`; pass a positive integer to override. |
 | `--write_buf_size` | `32768` | BufWriter buffer size for the TLS write half, in bytes. |
 | `--stream_channel_capacity` | `128` | Per-stream data channel capacity (number of buffered messages). |
-| `--downlink_padding` | `true` | Server-side downlink shaping: pads small Settings/SynAck heads and splits larger writes to reduce TLS-in-TLS length correlations. Small data tails and timing patterns can remain observable. Only applies to clients announcing protocol v2. Set `false` for an unshaped control. |
-| `--downlink_burst_padding` | `true` | Bounded early downlink padding. After a successful SynAck, opens a session-wide window of at most 3 seconds, 8 emitted records, and 2 KiB of additional padding. Fills small complete-frame tails and adds random bytes to larger tails. Requires `--downlink_padding true` and protocol v2. Set `false` to retain only the previous split/head-fill policy. |
+| `--downlink_padding` | `true` | Server-side downlink shaping for protocol v1/v2. v2 uses a bounded session-level early window, then normal bulk buffering; controls retain a 10-byte Waste suffix. v1 retains split/head-fill shaping. Set `false` for an unshaped control. |
+| `--downlink_burst_padding` | `true` | v2: substantial fill during the first 8 non-empty flush attempts, capped at 8 KiB per outer session. v1: at most 3 seconds / 8 records / 2 KiB after outbound success. Requires `--downlink_padding true`. Set `false` to disable substantial v2 early fill while retaining its small control suffix, or retain only v1 split/head-fill. |
 | `--refresh_geodata` | `false` | Force refresh ACL geodata |
 
 Early downlink padding is enabled by default. Disable it with
 `--downlink_burst_padding false` or
-`X_PANDA_ANYTLS_DOWNLINK_BURST_PADDING=false`. It adds no deliberate delay and
-does not change the client's padding scheme. Each successful SynAck replaces
-the current window; concurrent streams share its budget. The 2 KiB limit
-excludes existing Settings/SynAck fill, TLS record overhead, and TCP/IP overhead.
-Once any limit is reached, the normal split/head-fill policy resumes. A residual
-budget smaller than the requested fill may leave a short record.
+`X_PANDA_ANYTLS_DOWNLINK_BURST_PADDING=false`. The client's padding scheme and
+MD5 do not change. For v2, Settings, heartbeat replies, SynAck, data and FIN
+share one non-renewable window: the first eight non-empty plaintext flush
+attempts target 500–1000 bytes. The window does not expire with time, and new
+streams or repeated Settings cannot replenish it. After the window, bulk data
+uses normal buffering and TLS fragmentation; control frames keep only the
+10-byte Waste suffix. That suffix is accounted separately from the 8 KiB
+substantial-padding limit. It adds 10 bytes per control frame for the life of
+the session; ordinary data writes have no permanent suffix.
 
-This is an experiment for sparse HTTPS traffic such as periodic URL tests, not
-a guarantee against traffic classification or IP blocking. It does not hide
-uplink traffic shapes, handshake round trips, or the interval between tests.
+The v2 policy follows observed reference-server behavior, rather than a known
+copy of its internal algorithm. Plaintext flushes are not necessarily individual
+TLS records. v1 retains its existing per-stream early window and continuous
+split/head-fill policy. These policies do not deliberately delay writes or
+remove directional/timing correlations, and do not establish censorship resistance.
+
 Session-close debug logs report total shaping bytes and padding cost; measure
 latency, overhead, and IP survival on a canary before enabling it across a fleet.
 `cargo test --test tls_in_tls_padding -- --nocapture` runs a local HTTPS HEAD/204
