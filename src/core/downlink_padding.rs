@@ -37,7 +37,7 @@
 //!   ~9× more records than it would at 16 KiB — the byte cost is negligible,
 //!   the per-record cost is small but not zero.
 //! * **fill** — the first record of a *burst* (the session head, and the head of
-//!   each proxied connection's downlink, which starts at `SynAck`) is padded up
+//!   each proxied connection's downlink, marked on outbound success) is padded up
 //!   into `[HEAD_MIN, HEAD_MAX]` with a `Waste` frame. This is the only place
 //!   real bytes are spent, and the only place they are needed: the band's floor
 //!   lifts a 7-byte `SynAck` to a record size that reads like a handshake
@@ -46,7 +46,8 @@
 //! The split/head-fill policy alone leaves data tails and other control frames
 //! unpadded, preserving some short inner-handshake/HTTP-response lengths. The
 //! early-window policy, enabled by default by the server, fills tails after
-//! successful `SynAck`, bounded by time, record count, and additional bytes.
+//! successful outbound connection, bounded by time, record count, and
+//! additional bytes.
 //! Larger tails also get random extra bytes to change burst totals. It neither
 //! delays writes deliberately nor removes directional/timing correlations.
 //!
@@ -61,12 +62,11 @@
 //!
 //! # Compatibility
 //!
-//! Shaping is gated twice. The operator flag ([`DownlinkShaper::new`]'s first
-//! argument) decides whether the feature exists at all, and [`DownlinkShaper::enable`]
-//! is only called once the peer has announced protocol v2 — which is exactly the
-//! announcement that says "I understand `ServerSettings`, and I will silently
-//! discard `Waste`". A legacy peer never sends it, so `enable()` is never called
-//! and the downlink is byte-for-byte what it was before this module existed.
+//! Shaping is gated by the operator flag and a supported peer version. Both
+//! v1 and v2 understand `Waste`. v1 enables shaping when Settings arrives,
+//! including when its padding md5 matches and no settings reply is needed.
+//! Since v1 has no `SynAck`, outbound success marks its next data record as a
+//! burst head and starts the same bounded early window used by v2.
 //!
 //! Nothing here touches the padding *scheme* string or its md5, so no client is
 //! asked to re-handshake, and the shaper allocates nothing per record — just
@@ -175,7 +175,7 @@ impl ShapingCounters {
 pub struct DownlinkShaper {
     /// The operator's flag. Shaping can happen only when this is set.
     configured: bool,
-    /// The live switch: `configured` **and** the peer announced v2.
+    /// The live switch: `configured` and the peer announced a supported version.
     enabled: bool,
     /// Plaintext bytes already handed to the writer for the current record.
     pending: usize,
@@ -232,7 +232,7 @@ impl DownlinkShaper {
         shaper
     }
 
-    /// Start shaping. Called once the peer has announced protocol v2, under the
+    /// Start shaping. Called once the peer has announced protocol v1/v2, under the
     /// same write lock as the first shaped record.
     ///
     /// A no-op when the operator disabled the feature, so an operator switch is
@@ -249,7 +249,7 @@ impl DownlinkShaper {
         self.enabled
     }
 
-    /// Optional early-window padding, still gated by the main flag and v2.
+    /// Optional early-window padding, still gated by the main flag and Settings.
     pub fn configure_burst_padding(&mut self, enabled: bool) {
         self.burst_configured = enabled;
         if !enabled {
@@ -257,7 +257,7 @@ impl DownlinkShaper {
         }
     }
 
-    /// Re-arm only after a successful SynAck has been flushed. Windows belong
+    /// Re-arm after outbound success (after flushing SynAck for v2). Windows belong
     /// to the outer session, so overlapping streams share (rather than add)
     /// this budget. No per-stream allocation or timer task is needed.
     pub fn start_burst_padding(&mut self) {
@@ -358,8 +358,8 @@ impl DownlinkShaper {
         }
     }
 
-    /// Mark the next record as a burst head: the session start, or a `SynAck`
-    /// (the head of a proxied connection's downlink burst).
+    /// Mark the next record as a burst head: the session start, or the head of
+    /// a proxied connection's downlink (`SynAck` for v2, first data for v1).
     pub fn mark_burst_head(&mut self) {
         if !self.enabled {
             return;
@@ -685,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_configured_but_not_enabled_leaves_the_wire_untouched() {
-        // The operator said yes, but no v2 settings ever arrived — the only
+        // The operator said yes, but no supported settings ever arrived — the only
         // thing that starts shaping. Output must be exactly what it was before
         // this module existed.
         let (mut ws, log) = setup(true);
@@ -960,7 +960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_burst_padding_cannot_enable_legacy_or_disabled_shaping() {
+    async fn test_burst_padding_cannot_enable_unnegotiated_or_disabled_shaping() {
         for main_flag in [false, true] {
             let (mut ws, log) = setup(main_flag);
             ws.shaper_mut().configure_burst_padding(true);

@@ -78,7 +78,12 @@ fn record_lengths(bytes: &[u8]) -> Vec<usize> {
     lengths
 }
 
-async fn https_probe(burst_padding: Option<bool>) -> Vec<usize> {
+async fn https_probe(
+    burst_padding: Option<bool>,
+    version: u8,
+    matched: bool,
+    enabled: bool,
+) -> Vec<usize> {
     let (backend_tls, backend_client_tls) = tls_configs();
     let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend.local_addr().unwrap().port();
@@ -112,7 +117,8 @@ async fn https_probe(burst_padding: Option<bool>) -> Vec<usize> {
     let mut builder = Server::builder()
         .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
         .router(Arc::new(DirectRouter))
-        .tls_config(server_tls);
+        .tls_config(server_tls)
+        .downlink_padding(enabled);
     if let Some(enabled) = burst_padding {
         builder = builder.downlink_burst_padding(enabled);
     }
@@ -167,16 +173,36 @@ async fn https_probe(burst_padding: Option<bool>) -> Vec<usize> {
     auth.extend_from_slice(&0u16.to_be_bytes());
     outer.write_all(&auth).await.unwrap();
     let settings = format!(
-        "v=2\npadding-md5={}",
-        PaddingFactory::new(DEFAULT_SCHEME).unwrap().md5_hex()
+        "v={version}\npadding-md5={}",
+        if matched {
+            PaddingFactory::new(DEFAULT_SCHEME)
+                .unwrap()
+                .md5_hex()
+                .to_owned()
+        } else {
+            "0".repeat(32)
+        }
     );
     outer
         .write_all(&frame(Command::Settings, 0, settings.as_bytes()))
         .await
         .unwrap();
-    loop {
-        if read_frame(&mut outer).await.0.command == Command::ServerSettings {
-            break;
+    if version >= 2 || !matched {
+        let expected = if version >= 2 {
+            Command::ServerSettings
+        } else {
+            Command::UpdatePaddingScheme
+        };
+        loop {
+            let command = read_frame(&mut outer).await.0.command;
+            assert!(
+                command == expected
+                    || command == Command::Waste
+                    || command == Command::UpdatePaddingScheme
+            );
+            if command == expected {
+                break;
+            }
         }
     }
     outer.write_all(&frame(Command::Syn, 1, &[])).await.unwrap();
@@ -186,11 +212,13 @@ async fn https_probe(burst_padding: Option<bool>) -> Vec<usize> {
         .write_all(&frame(Command::Psh, 1, &address))
         .await
         .unwrap();
-    loop {
-        let (header, payload) = read_frame(&mut outer).await;
-        if header.command == Command::SynAck {
-            assert!(payload.is_empty());
-            break;
+    if version >= 2 {
+        loop {
+            let (header, payload) = read_frame(&mut outer).await;
+            if header.command == Command::SynAck {
+                assert!(payload.is_empty());
+                break;
+            }
         }
     }
     captured.lock().unwrap().clear();
@@ -251,7 +279,7 @@ async fn https_probe(burst_padding: Option<bool>) -> Vec<usize> {
 
 #[tokio::test]
 async fn test_https_204_early_downlink_records_are_padded() {
-    let lengths = tokio::time::timeout(Duration::from_secs(10), https_probe(None))
+    let lengths = tokio::time::timeout(Duration::from_secs(10), https_probe(None, 2, true, true))
         .await
         .unwrap();
     println!("early padding enabled, encrypted TLS record lengths: {lengths:?}");
@@ -267,12 +295,42 @@ async fn test_https_204_early_downlink_records_are_padded() {
 
 #[tokio::test]
 async fn test_https_204_control_keeps_short_record() {
-    let lengths = tokio::time::timeout(Duration::from_secs(10), https_probe(Some(false)))
-        .await
-        .unwrap();
+    let lengths = tokio::time::timeout(
+        Duration::from_secs(10),
+        https_probe(Some(false), 2, true, true),
+    )
+    .await
+    .unwrap();
     println!("early padding disabled, encrypted TLS record lengths: {lengths:?}");
     assert!(
         lengths.iter().any(|&n| n < 160),
         "control no longer reproduces the short HTTPS response: {lengths:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_v1_https_204_downlink_is_padded_with_matching_or_updated_scheme() {
+    for matched in [true, false] {
+        let lengths =
+            tokio::time::timeout(Duration::from_secs(10), https_probe(None, 1, matched, true))
+                .await
+                .unwrap();
+        println!("v1 matched={matched}, encrypted TLS record lengths: {lengths:?}");
+        assert!(lengths.len() >= 2);
+        assert!(
+            lengths.iter().all(|&n| n >= 337),
+            "v1 short response exposed: {lengths:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_v1_https_204_padding_off_preserves_short_record() {
+    let lengths = tokio::time::timeout(Duration::from_secs(10), https_probe(None, 1, true, false))
+        .await
+        .unwrap();
+    assert!(
+        lengths.iter().any(|&n| n < 160),
+        "off switch did not preserve short response: {lengths:?}"
     );
 }

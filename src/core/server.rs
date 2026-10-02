@@ -42,8 +42,7 @@ pub struct ServerConfig {
     pub write_buf_size: usize,
     /// Operator switch for server-side downlink padding ("补包").
     ///
-    /// Enabled by default but only takes effect for peers that announce
-    /// protocol v2, so legacy clients see byte-identical output. See
+    /// Enabled by default for peers that announce protocol v1 or v2. See
     /// [`crate::core::downlink_padding`].
     pub downlink_padding: bool,
     pub downlink_burst_padding: bool,

@@ -765,12 +765,13 @@ mod tests {
     /// Should be <= 64KB for reasonable memory footprint.
     #[test]
     fn test_relay_buf_size_reasonable() {
-        assert!(
-            RELAY_BUF_SIZE <= 64 * 1024,
-            "RELAY_BUF_SIZE should be <= 64KB for reasonable memory usage \
-             under high concurrency, but is {} KB",
-            RELAY_BUF_SIZE / 1024
-        );
+        const {
+            assert!(
+                RELAY_BUF_SIZE <= 64 * 1024,
+                "RELAY_BUF_SIZE should be <= 64KB for reasonable memory usage \
+                 under high concurrency"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

@@ -117,11 +117,10 @@ pub struct SessionConfig {
     pub stream_channel_capacity: usize,
     /// Operator switch for server-side downlink padding ("补包").
     ///
-    /// Enabled by default, but only ever takes effect for peers that announce
-    /// protocol v2, so legacy clients keep the exact wire behaviour they had
-    /// before this existed. See [`crate::core::downlink_padding`].
+    /// Enabled by default for peers announcing protocol v1 or v2. Both support
+    /// Waste frames. See [`crate::core::downlink_padding`].
     pub downlink_padding: bool,
-    /// Bounded padding after successful SynAck; enabled by default for v2.
+    /// Bounded padding after outbound success; enabled by default for v1/v2.
     pub downlink_burst_padding: bool,
 }
 
@@ -360,6 +359,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     self.peer_version.store(peer_version, Ordering::Relaxed);
                     settings_received = true;
 
+                    // v1 also understands Waste, but may need no settings reply.
+                    // Enable before any stream can produce downlink data.
+                    if peer_version == 1 && self.config.downlink_padding {
+                        let mut w = tokio::time::timeout(WRITE_TIMEOUT, self.write_half.lock())
+                            .await
+                            .map_err(|_| crate::error::Error::WriteTimeout)?;
+                        w.shaper_mut().enable();
+                    }
+
                     // Batch settings response frames under a single lock + flush.
                     let need_padding = peer_padding_md5 != self.padding.md5_hex();
                     let need_server_settings = peer_version >= 2;
@@ -469,8 +477,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             // half header in the buffer that the next writer appended behind,
             // corrupting the frame stream from there on. After this, a
             // timed-out flush always leaves a *complete* frame buffered.
-            // Legacy v1 peers never have a pending record (the shaper is
-            // inert), so this is a no-op there and the wire stays byte-identical.
+            // With shaping disabled there is no tracked pending record.
             w.ensure_record_boundary().await?;
             // A `SynAck` is the head of a proxied connection's downlink burst:
             // the first bytes the peer sees for that stream, and the smallest
@@ -582,8 +589,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
     }
 
     pub async fn handshake_success(&self, stream_id: u32) -> Result<()> {
-        if self.peer_version.load(Ordering::Relaxed) >= 2 {
+        let peer_version = self.peer_version.load(Ordering::Relaxed);
+        if peer_version >= 2 {
             self.write_frame(Command::SynAck, stream_id, &[]).await?;
+        } else if peer_version == 1 && self.config.downlink_padding {
+            // v1 has no SynAck. Protect its first data response without sending
+            // a v2-only frame or allocating a per-stream timer/buffer.
+            let mut w = tokio::time::timeout(WRITE_TIMEOUT, self.write_half.lock())
+                .await
+                .map_err(|_| crate::error::Error::WriteTimeout)?;
+            w.shaper_mut().mark_burst_head();
+            w.shaper_mut().start_burst_padding();
         }
         Ok(())
     }
@@ -975,87 +991,91 @@ mod tests {
         }
     }
 
-    /// A legacy (v=1) peer must see byte-for-byte the output the pre-shaper
-    /// server produced, *even though* `downlink_padding` defaults to true.
-    ///
-    /// A v=1 peer that already knows our padding scheme takes the early return
-    /// in `write_settings_response`, so `enable()` is never reached and the
-    /// shaper stays inert: `write_budget()` returns `usize::MAX` (no record
-    /// splits), `account()` returns false (no mid-write flush) and
-    /// `tail_padding()` returns 0 (no Waste frame). The assertions below are
-    /// absolute byte literals rather than values derived from the shaper's own
-    /// constants — deriving them would let a broken shaper assert itself.
+    /// v1 peers use Waste padding without receiving v2-only response frames.
     #[tokio::test]
-    async fn test_legacy_peer_output_is_unshaped() {
-        let (mut client_io, server_io) = duplex(65536);
-        let config = SessionConfig::default();
-        assert!(
-            config.downlink_padding,
-            "padding is on by default; this test only means anything with it on"
-        );
-        let session = Arc::new(Session::new_server(server_io, test_padding(), config));
-
-        // v=1 + matching md5 ⇒ need_padding == false, need_server_settings ==
-        // false ⇒ write_settings_response returns before `enable()`.
-        let settings_data = format!("v=1\npadding-md5={}", session.padding_md5());
-        write_frame(
-            &mut client_io,
-            Command::Settings,
-            0,
-            settings_data.as_bytes(),
-        )
-        .await;
-
-        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
-        let sess = session.clone();
-        let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, CancellationToken::new())
+    async fn test_v1_downlink_padding_respects_existing_switches() {
+        for (enabled, burst) in [(true, true), (true, false), (false, true)] {
+            let (mut client_io, server_io) = duplex(65536);
+            let config = SessionConfig {
+                downlink_padding: enabled,
+                downlink_burst_padding: burst,
+                ..SessionConfig::default()
+            };
+            let session = Arc::new(Session::new_server(server_io, test_padding(), config));
+            let settings = format!("v=1\npadding-md5={}", session.padding_md5());
+            write_frame(&mut client_io, Command::Settings, 0, settings.as_bytes()).await;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let sess = session.clone();
+            let handle =
+                tokio::spawn(async move { sess.recv_loop(tx, CancellationToken::new()).await });
+            write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+            let _stream = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
                 .await
-        });
-
-        // Barrier instead of a sleep: the recv loop answers a HeartRequest with
-        // a bare 7-byte HeartResponse `[9,0,0,0,0,0,0]`. Reading it proves the
-        // Settings frame was processed — so `write_settings_response` ran its
-        // `enable()` decision for a v=1 peer and correctly skipped it — before
-        // the Psh output is measured. The old `sleep(50ms)` could pass
-        // vacuously if the loop was still settling.
-        write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
-        let mut heartbeat = [0u8; HEADER_SIZE];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            client_io.read_exact(&mut heartbeat),
-        )
-        .await
-        .expect("timed out waiting for the HeartResponse barrier")
-        .expect("read failed");
-        assert_eq!(
-            heartbeat,
-            [9, 0, 0, 0, 0, 0, 0],
-            "server must answer with a bare 7-byte HeartResponse"
-        );
-
-        session.write_frame(Command::Psh, 7, b"data").await.unwrap();
-
-        // Exactly 7 header bytes + 4 payload bytes: one record, one frame.
-        // A shaped path would have split the write and/or appended a Waste
-        // frame at the tail.
-        let mut got = [0u8; 11];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            client_io.read_exact(&mut got),
-        )
-        .await
-        .expect("timed out waiting for the Psh frame")
-        .expect("read failed");
-        assert_eq!(
-            got,
-            [2, 0, 0, 0, 7, 0, 4, b'd', b'a', b't', b'a'],
-            "legacy peer must receive the plain 11-byte Psh frame"
-        );
-        assert_stream_quiet(&mut client_io, 200).await;
-
-        drop(client_io);
-        let _ = handle.await;
+                .unwrap()
+                .unwrap();
+            session.handshake_success(1).await.unwrap();
+            session.handshake_failure(3, "rejected").await.unwrap();
+            assert_stream_quiet(&mut client_io, 20).await;
+            for response in 0..2 {
+                session.write_frame(Command::Psh, 1, b"data").await.unwrap();
+                let mut header = [0; HEADER_SIZE];
+                client_io.read_exact(&mut header).await.unwrap();
+                let frame = FrameHeader::decode(&header);
+                assert_eq!(frame.command, Command::Psh);
+                assert_eq!(frame.stream_id, 1);
+                let mut payload = vec![0; frame.length as usize];
+                client_io.read_exact(&mut payload).await.unwrap();
+                assert_eq!(payload, b"data");
+                if enabled && (response == 0 || burst) {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        client_io.read_exact(&mut header),
+                    )
+                    .await
+                    .expect("v1 padding missing")
+                    .unwrap();
+                    let waste = FrameHeader::decode(&header);
+                    assert_eq!(waste.command, Command::Waste);
+                    let mut payload = vec![0; waste.length as usize];
+                    client_io.read_exact(&mut payload).await.unwrap();
+                    assert!(11 + HEADER_SIZE + payload.len() >= 320);
+                }
+                assert_stream_quiet(&mut client_io, 20).await;
+            }
+            // A second stream in the same v1 session has no SynAck either,
+            // but its first response must still receive head padding.
+            write_frame(&mut client_io, Command::Syn, 3, &[]).await;
+            let _second_stream = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            session.handshake_success(3).await.unwrap();
+            assert_stream_quiet(&mut client_io, 20).await;
+            session.write_frame(Command::Psh, 3, b"data").await.unwrap();
+            let mut response = [0; 11];
+            client_io.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [2, 0, 0, 0, 3, 0, 4, b'd', b'a', b't', b'a']);
+            if enabled {
+                let mut header = [0; HEADER_SIZE];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    client_io.read_exact(&mut header),
+                )
+                .await
+                .expect("reused v1 stream padding missing")
+                .unwrap();
+                let waste = FrameHeader::decode(&header);
+                assert_eq!(waste.command, Command::Waste);
+                let mut payload = vec![0; waste.length as usize];
+                client_io.read_exact(&mut payload).await.unwrap();
+            }
+            assert_stream_quiet(&mut client_io, 20).await;
+            let stats = session.shaping_stats();
+            assert_eq!(stats.records > 0, enabled);
+            assert!(stats.padded <= 2 * (1400 + 2048));
+            drop(client_io);
+            let _ = handle.await;
+        }
     }
 
     /// Positive control: a v=2 peer that already knows our padding scheme needs
@@ -1148,7 +1168,7 @@ mod tests {
     /// the records the wire actually carried. A v=2 peer gets one shaped head
     /// record (ServerSettings + Waste fill), so afterwards the counters show
     /// records >= 1 and padding > 0. The handler gates its `debug!` line on
-    /// `records > 0`, so this is also what keeps a legacy session silent.
+    /// `records > 0`, so this also distinguishes shaped and unshaped sessions.
     #[tokio::test]
     async fn test_session_reports_shaping_stats() {
         let (mut client_io, server_io) = duplex(65536);
@@ -1443,14 +1463,13 @@ mod tests {
                     break;
                 }
                 let hdr = FrameHeader::decode(&hdr_buf);
-                if hdr.length > 0 {
-                    if client_io
+                if hdr.length > 0
+                    && client_io
                         .read_exact(&mut skip_buf[..hdr.length as usize])
                         .await
                         .is_err()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
                 if hdr.stream_id == 1 {
                     match hdr.command {

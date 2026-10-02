@@ -127,9 +127,9 @@ pub(crate) async fn handle_connection(
 
     // Session-close report: the online cost of downlink padding is otherwise
     // unobservable (ShapingCounters has no other consumer). `records == 0`
-    // means shaping never engaged — a legacy v1 peer, or the operator turned
-    // the feature off — so the line only fires for sessions that actually
-    // shaped, and doubles as a live v2-adoption signal.
+    // means no shaped write was observed (for example, the operator turned
+    // the feature off), so the line only fires for sessions that actually
+    // shaped. Both v1 and v2 can contribute.
     //
     // `debug!`, not `info!`: a per-session detail that would clutter even
     // routine `info`-level troubleshooting logs, and it is invisible at the

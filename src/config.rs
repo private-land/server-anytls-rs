@@ -137,9 +137,8 @@ pub struct CliArgs {
 
     /// Server-side downlink shaping to reduce TLS-in-TLS length correlations.
     ///
-    /// Only applies to clients announcing protocol v2; legacy clients are
-    /// byte-for-byte unaffected. Disable to fall back to the unshaped write
-    /// path (useful as a control when measuring block rates).
+    /// Applies to clients announcing protocol v1 or v2. Disable to fall back
+    /// to the unshaped write path (useful as a control when measuring block rates).
     #[arg(
         long,
         env = "X_PANDA_ANYTLS_DOWNLINK_PADDING",
@@ -154,7 +153,7 @@ pub struct CliArgs {
     pub downlink_padding: bool,
 
     /// Experimental early downlink padding, bounded to 2 KiB / 8 records / 3s
-    /// after each successful SynAck. Requires downlink_padding and protocol v2.
+    /// after each successful outbound connection. Requires downlink_padding.
     #[arg(
         long,
         env = "X_PANDA_ANYTLS_DOWNLINK_BURST_PADDING",

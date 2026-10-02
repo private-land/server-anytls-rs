@@ -632,13 +632,8 @@ mod tests {
         let echo_udp = remote_udp;
         tokio::spawn(async move {
             let mut buf = [0u8; 65536];
-            loop {
-                match echo_udp.recv_from(&mut buf).await {
-                    Ok((n, src)) => {
-                        let _ = echo_udp.send_to(&buf[..n], src).await;
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((n, src)) = echo_udp.recv_from(&mut buf).await {
+                let _ = echo_udp.send_to(&buf[..n], src).await;
             }
         });
 
