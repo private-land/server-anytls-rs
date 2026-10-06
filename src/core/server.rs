@@ -38,6 +38,9 @@ pub struct ServerConfig {
     pub max_streams_per_session: usize,
     pub tcp_connect_timeout: Duration,
     pub handshake_timeout: Duration,
+    /// Use a five-second authentication deadline and silently reject malformed
+    /// initial TLS input. Disable to retain the original handshake/auth path.
+    pub auth_probe_resistance: bool,
     /// BufWriter buffer size for the TLS write half (bytes).
     pub write_buf_size: usize,
     /// Operator switch for server-side downlink padding ("补包").
@@ -61,6 +64,7 @@ impl Default for ServerConfig {
             max_streams_per_session: 256,
             tcp_connect_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
+            auth_probe_resistance: true,
             write_buf_size: DEFAULT_WRITE_BUF_SIZE,
             downlink_padding: true,
             downlink_burst_padding: true,
@@ -173,6 +177,7 @@ pub struct ServerBuilder {
     max_streams_per_session: usize,
     tcp_connect_timeout: Duration,
     handshake_timeout: Duration,
+    auth_probe_resistance: bool,
     write_buf_size: usize,
     downlink_padding: bool,
     downlink_burst_padding: bool,
@@ -194,6 +199,7 @@ impl ServerBuilder {
             max_streams_per_session: defaults.max_streams_per_session,
             tcp_connect_timeout: defaults.tcp_connect_timeout,
             handshake_timeout: defaults.handshake_timeout,
+            auth_probe_resistance: defaults.auth_probe_resistance,
             write_buf_size: defaults.write_buf_size,
             downlink_padding: defaults.downlink_padding,
             downlink_burst_padding: defaults.downlink_burst_padding,
@@ -252,6 +258,11 @@ impl ServerBuilder {
         self
     }
 
+    pub fn auth_probe_resistance(mut self, enabled: bool) -> Self {
+        self.auth_probe_resistance = enabled;
+        self
+    }
+
     pub fn write_buf_size(mut self, n: usize) -> Self {
         self.write_buf_size = n;
         self
@@ -298,6 +309,7 @@ impl ServerBuilder {
             max_streams_per_session: self.max_streams_per_session,
             tcp_connect_timeout: self.tcp_connect_timeout,
             handshake_timeout: self.handshake_timeout,
+            auth_probe_resistance: self.auth_probe_resistance,
             write_buf_size: self.write_buf_size,
             downlink_padding: self.downlink_padding,
             downlink_burst_padding: self.downlink_burst_padding,
@@ -350,6 +362,7 @@ mod tests {
         assert_eq!(server.config.max_connections, 10000);
         assert_eq!(server.config.max_streams_per_session, 256);
         assert_eq!(server.config.handshake_timeout, Duration::from_secs(10));
+        assert!(server.config.auth_probe_resistance);
         assert_eq!(server.config.relay_idle_timeout, Duration::from_secs(60));
     }
 

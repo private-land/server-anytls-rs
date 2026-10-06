@@ -393,11 +393,12 @@ async fn test_auth_failure() {
 
     // Server should close the connection — reading should return EOF or error
     let mut buf = [0u8; 128];
-    let result = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut buf)).await;
+    let result = tokio::time::timeout(Duration::from_secs(6), tls.read(&mut buf)).await;
     match result {
-        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
+        Ok(Ok(0)) | Ok(Err(_)) => {
             // Expected: connection closed or error
         }
+        Err(_) => panic!("authentication failure exceeded its deadline"),
         Ok(Ok(n)) => {
             panic!(
                 "expected connection close after auth failure, got {} bytes",

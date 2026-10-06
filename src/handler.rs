@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use std::net::SocketAddr;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
@@ -16,6 +16,55 @@ use crate::error::{Error, Result};
 
 /// Maximum allowed padding length in auth (cap at 1KB to prevent DoS).
 const MAX_PADDING_LEN: u16 = 1024;
+const AUTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Parse the initial ClientHello without transmitting rustls's parse-error
+/// alert. Retain unread TCP bytes when continuing the normal TLS handshake.
+async fn accept_silent_client_hello(
+    tcp: TcpStream,
+    config: Arc<rustls::ServerConfig>,
+) -> Result<tokio_rustls::server::TlsStream<BufReader<TcpStream>>> {
+    let mut io = BufReader::new(tcp);
+    let mut acceptor = rustls::server::Acceptor::default();
+    loop {
+        let mut bytes = io.fill_buf().await?;
+        if bytes.is_empty() {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+        let consumed = acceptor.read_tls(&mut bytes)?;
+        io.consume(consumed);
+        match acceptor.accept() {
+            Ok(Some(accepted)) => {
+                return Ok(
+                    tokio_rustls::server::StartHandshake::from_parts(accepted, io)
+                        .into_stream(config)
+                        .await?,
+                );
+            }
+            Ok(None) => {}
+            Err((error, _alert)) => return Err(error.into()),
+        }
+    }
+}
+
+async fn read_auth_with_deadline<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    authenticator: &dyn Authenticator,
+) -> Result<UserId> {
+    let deadline = tokio::time::Instant::now() + AUTH_PROBE_TIMEOUT;
+    let error = match tokio::time::timeout_at(deadline, read_auth(reader, authenticator)).await {
+        Ok(Ok(Some(user_id))) => return Ok(user_id),
+        Ok(Ok(None)) => Error::AuthFailed,
+        Ok(Err(error)) => error,
+        Err(_) => return Err(Error::HandshakeTimeout),
+    };
+    // Drain rejected input until the original deadline, or release the
+    // connection early if the peer leaves. No auth retry or session creation.
+    // Reading the remainder also avoids a TCP reset from unread application data.
+    let _ =
+        tokio::time::timeout_at(deadline, tokio::io::copy(reader, &mut tokio::io::sink())).await;
+    Err(error)
+}
 
 pub(crate) async fn read_auth<R: AsyncRead + Unpin>(
     reader: &mut R,
@@ -64,6 +113,19 @@ pub(crate) async fn handle_connection(
         .clone()
         .ok_or_else(|| Error::Tls(rustls::Error::General("no TLS config".into())))?;
 
+    if server.config.auth_probe_resistance {
+        let tls_stream = tokio::time::timeout(
+            server.config.handshake_timeout,
+            accept_silent_client_hello(tcp_stream, tls_config),
+        )
+        .await
+        .map_err(|_| Error::HandshakeTimeout)??;
+        let mut buf_stream = BufReader::new(tls_stream);
+        let user_id =
+            read_auth_with_deadline(&mut buf_stream, server.authenticator.as_ref()).await?;
+        return run_authenticated_session(server, buf_stream, user_id, peer_addr).await;
+    }
+
     let acceptor = TlsAcceptor::from(tls_config);
 
     // Wrap TLS handshake + auth read in a single timeout to prevent
@@ -81,6 +143,15 @@ pub(crate) async fn handle_connection(
     .await
     .map_err(|_| Error::HandshakeTimeout)??;
 
+    run_authenticated_session(server, buf_stream, user_id, peer_addr).await
+}
+
+async fn run_authenticated_session<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    server: Arc<Server>,
+    buf_stream: T,
+    user_id: UserId,
+    peer_addr: SocketAddr,
+) -> Result<()> {
     // Register connection after successful authentication
     let (conn_id, cancel_token) = server.connection_manager.register(user_id, peer_addr);
     // Ensure unregister on exit (even on panic)

@@ -164,6 +164,17 @@ pub struct CliArgs {
     )]
     pub downlink_burst_padding: bool,
 
+    /// Uniform five-second authentication deadline and silent rejection of
+    /// malformed initial TLS input. Set false to retain legacy behavior.
+    #[arg(
+        long,
+        visible_alias = "auth-probe-resistance",
+        env = "X_PANDA_ANYTLS_AUTH_PROBE_RESISTANCE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub auth_probe_resistance: bool,
+
     /// Per-stream data channel capacity (number of buffered messages).
     #[arg(
         long,
@@ -263,6 +274,7 @@ mod tests {
             write_buf_size: 32 * 1024,
             downlink_padding: true,
             downlink_burst_padding: true,
+            auth_probe_resistance: true,
             stream_channel_capacity: 128,
         }
     }
@@ -441,6 +453,22 @@ mod tests {
         assert!(cli.downlink_padding);
         assert!(cli.downlink_burst_padding);
         assert_eq!(cli.stream_channel_capacity, 128);
+    }
+
+    #[test]
+    fn test_auth_probe_resistance_default_and_explicit_values() {
+        let cli = CliArgs::try_parse_from(["anytls", "--node", "1"]).unwrap();
+        assert!(cli.auth_probe_resistance);
+        for flag in ["--auth_probe_resistance", "--auth-probe-resistance"] {
+            for enabled in [true, false] {
+                let value = enabled.to_string();
+                let cli = CliArgs::try_parse_from(["anytls", "--node", "1", flag, &value]).unwrap();
+                assert_eq!(cli.auth_probe_resistance, enabled);
+                let argument = format!("{flag}={value}");
+                let cli = CliArgs::try_parse_from(["anytls", "--node", "1", &argument]).unwrap();
+                assert_eq!(cli.auth_probe_resistance, enabled);
+            }
+        }
     }
 
     #[test]

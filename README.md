@@ -58,7 +58,21 @@ All arguments support environment variables with `X_PANDA_ANYTLS_` prefix.
 | `--stream_channel_capacity` | `128` | Per-stream data channel capacity (number of buffered messages). |
 | `--downlink_padding` | `true` | Server-side downlink shaping for protocol v1/v2. v2 uses a bounded session-level early window, then normal bulk buffering; controls retain a 10-byte Waste suffix. v1 retains split/head-fill shaping. Set `false` for an unshaped control. |
 | `--downlink_burst_padding` | `true` | v2: substantial fill during the first 8 non-empty flush attempts, capped at 8 KiB per outer session. v1: at most 3 seconds / 8 records / 2 KiB after outbound success. Requires `--downlink_padding true`. Set `false` to disable substantial v2 early fill while retaining its small control suffix, or retain only v1 split/head-fill. |
+| `--auth_probe_resistance` | `true` | Silently reject malformed initial TLS input and close failed/incomplete authentication at a shared 5-second deadline after TLS handshake completion. Successful authentication proceeds immediately. Set `false` to retain the original handshake/authentication path. |
 | `--refresh_geodata` | `false` | Force refresh ACL geodata |
+
+Authentication probe resistance is enabled by default. Disable it with
+`--auth_probe_resistance false` (also `--auth-probe-resistance=false`) or
+`X_PANDA_ANYTLS_AUTH_PROBE_RESISTANCE=false`. After a successful TLS handshake,
+incomplete or rejected authentication closes at the same five-second deadline;
+later input cannot extend it. A peer that disconnects releases the connection
+early. Valid authentication proceeds immediately, including coalesced Settings.
+Malformed initial input, including plaintext HTTP, is silently rejected before
+accepting a ClientHello. Subsequent TLS negotiation retains rustls's normal
+error handling. The TLS handshake retains its separate bounded timeout. With
+the option disabled, TLS handshake and authentication use the original shared
+timeout, failed password checks close immediately, and TLS parse alerts are
+unchanged. This option does not modify padding or establish censorship resistance.
 
 Early downlink padding is enabled by default. Disable it with
 `--downlink_burst_padding false` or
