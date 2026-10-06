@@ -198,6 +198,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         // when a write error occurs (e.g. network disruption).
         let (write_cmd_tx, mut write_cmd_rx) =
             mpsc::channel::<WriteCommand>(self.config.write_cmd_capacity);
+        // The reader owns the stream table. Notify it when the ordered writer
+        // closes a stream; peers are not required to acknowledge FIN.
+        let (closed_tx, mut closed_rx) = mpsc::unbounded_channel::<u32>();
         let writer = self.write_half.clone();
         let writer_failed = CancellationToken::new();
         let writer_failed_signal = writer_failed.clone();
@@ -233,6 +236,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 if let Err(e) = res {
                     break Some(e);
                 }
+                if cmd.fin {
+                    let _ = closed_tx.send(cmd.stream_id);
+                }
 
                 // Batch more pending commands, but **release and re-acquire
                 // the lock between each command** so that control frame
@@ -257,6 +263,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     };
                     if let Err(e) = res {
                         break 'outer Some(e);
+                    }
+                    if cmd.fin {
+                        let _ = closed_tx.send(cmd.stream_id);
                     }
                     batch_remaining -= 1;
                 }
@@ -285,15 +294,25 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
 
         loop {
             let mut hdr_buf = [0u8; HEADER_SIZE];
-            let read_result = tokio::select! {
-                r = reader.read_exact(&mut hdr_buf) => r,
-                _ = cancel_token.cancelled() => {
-                    debug!("session cancelled by connection manager");
-                    break;
-                }
-                _ = writer_failed.cancelled() => {
-                    debug!("writer task failed, closing session");
-                    break;
+            // Keep the same read future across local close notifications:
+            // cancelling read_exact after a partial header would lose bytes.
+            let read_result = {
+                let read_header = reader.read_exact(&mut hdr_buf);
+                tokio::pin!(read_header);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {
+                            debug!("session cancelled by connection manager");
+                            return Ok(());
+                        }
+                        _ = writer_failed.cancelled() => {
+                            debug!("writer task failed, closing session");
+                            return Ok(());
+                        }
+                        Some(id) = closed_rx.recv() => { streams.remove(&id); }
+                        r = &mut read_header => break r,
+                    }
                 }
             };
             match read_result {
@@ -384,20 +403,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                             b"settings not received",
                         )
                         .await?;
-                        if len > 0 {
-                            payload_buf.resize(len, 0);
-                            reader.read_exact(&mut payload_buf[..len]).await?;
-                        }
-                        continue;
+                        break;
                     }
                     if streams.len() >= self.config.max_streams {
                         self.write_frame(Command::Alert, header.stream_id, b"max streams exceeded")
                             .await?;
-                        if len > 0 {
-                            payload_buf.resize(len, 0);
-                            reader.read_exact(&mut payload_buf[..len]).await?;
-                        }
-                        continue;
+                        break;
                     }
                     if len > 0 {
                         payload_buf.resize(len, 0);
@@ -435,7 +446,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                         payload_buf.resize(len, 0);
                         reader.read_exact(&mut payload_buf[..len]).await?;
                     }
-                    self.write_frame(Command::HeartResponse, 0, &[]).await?;
+                    self.write_frame(Command::HeartResponse, header.stream_id, &[])
+                        .await?;
                 }
                 // HeartResponse, Waste, and unknown commands: skip payload.
                 _ => {

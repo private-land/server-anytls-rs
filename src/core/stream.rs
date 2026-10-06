@@ -1,25 +1,37 @@
 use bytes::Bytes;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
-use tokio_util::sync::PollSender;
+use tokio_util::sync::{CancellationToken, PollSender};
 
 /// Handle for sending a FIN frame through the writer task channel.
 /// Extracted from a `Stream` before it is consumed (e.g. by `tokio::io::split`).
 pub struct FinSender {
     stream_id: u32,
     tx: mpsc::Sender<WriteCommand>,
+    fin_sent: Arc<AtomicBool>,
 }
 
 impl FinSender {
     pub async fn send_fin(&self) -> io::Result<()> {
-        let cmd = WriteCommand::fin(self.stream_id);
-        self.tx
-            .send(cmd)
+        if self.fin_sent.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Reserve before marking FIN sent so cancellation under backpressure
+        // cannot suppress a later close attempt.
+        let permit = self
+            .tx
+            .reserve()
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))?;
+        if !self.fin_sent.swap(true, Ordering::AcqRel) {
+            permit.send(WriteCommand::fin(self.stream_id));
+        }
+        Ok(())
     }
 }
 
@@ -48,6 +60,8 @@ pub struct Stream {
     /// Raw sender kept for `send_fin()` — works even after `tokio::io::split`.
     fin_tx: mpsc::Sender<WriteCommand>,
     read_buf: Bytes,
+    fin_sent: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 }
 
 impl Stream {
@@ -63,12 +77,18 @@ impl Stream {
             fin_tx: session_tx.clone(),
             session_tx: PollSender::new(session_tx),
             read_buf: Bytes::new(),
+            fin_sent: Arc::new(AtomicBool::new(false)),
+            shutdown: CancellationToken::new(),
         };
         (data_tx, stream)
     }
 
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     /// Returns a sender that can enqueue a FIN for this stream through the
@@ -78,6 +98,7 @@ impl Stream {
         FinSender {
             stream_id: self.id,
             tx: self.fin_tx.clone(),
+            fin_sent: self.fin_sent.clone(),
         }
     }
 
@@ -127,6 +148,12 @@ impl AsyncWrite for Stream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.fin_sent.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream closed",
+            )));
+        }
         match self.session_tx.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
                 let stream_id = self.id;
@@ -153,8 +180,39 @@ impl AsyncWrite for Stream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.fin_sent.load(Ordering::Acquire) {
+            self.session_tx.abort_send();
+            self.data_rx.close();
+            self.shutdown.cancel();
+            return Poll::Ready(Ok(()));
+        }
+        match self.session_tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                if self.fin_sent.swap(true, Ordering::AcqRel) {
+                    self.session_tx.abort_send();
+                } else {
+                    let id = self.id;
+                    if self.session_tx.send_item(WriteCommand::fin(id)).is_err() {
+                        self.fin_sent.store(false, Ordering::Release);
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "session closed",
+                        )));
+                    }
+                }
+                // AnyTLS FIN closes the whole stream. Stop accepting uploads
+                // and let the relay release its socket without peer FIN.
+                self.data_rx.close();
+                self.shutdown.cancel();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

@@ -651,74 +651,104 @@ async fn test_blackhole_outbound_causes_zombie_server() {
     shutdown.cancel();
 }
 
-/// GREEN: With `relay_idle_timeout` configured, stuck relays are terminated
-/// after the idle period expires, releasing semaphore permits so the server
-/// can accept new connections again — proving recovery from the zombie state.
-///
-/// Same setup as `test_blackhole_outbound_causes_zombie_server` but with a
-/// short `relay_idle_timeout(2s)`. After the timeout fires, stuck relays are
-/// killed, permits are freed, and new connections succeed.
+/// An idle relay releases its stream slot and leaves the outer session usable.
+/// Connection permits remain owned by live sessions until their clients close.
 #[tokio::test]
 async fn test_blackhole_outbound_recovers_with_idle_timeout() {
     let (blackhole_port, blackhole_cancel, blackhole_connections) = start_blackhole_server().await;
-
+    let (echo_port, echo_cancel) = start_echo_server().await;
     let (tls_server_config, tls_client_config) = make_tls_configs();
-    let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
-    let padding_md5 = padding.md5_hex().to_string();
-
+    let padding_md5 = PaddingFactory::new(DEFAULT_SCHEME)
+        .unwrap()
+        .md5_hex()
+        .to_string();
     let server = Arc::new(
         Server::builder()
             .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
             .router(Arc::new(DirectRouter))
             .tls_config(tls_server_config)
             .max_connections(2)
-            .relay_idle_timeout(Duration::from_secs(2))
+            .max_streams_per_session(1)
+            .relay_idle_timeout(Duration::from_secs(1))
             .build()
             .unwrap(),
     );
-
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_port = listener.local_addr().unwrap().port();
     let shutdown = CancellationToken::new();
-    let shutdown_clone = shutdown.clone();
-
+    let stop = shutdown.clone();
     tokio::spawn(async move {
-        let _ = server.run(listener, shutdown_clone).await;
+        let _ = server.run(listener, stop).await;
     });
-
     let connector = TlsConnector::from(tls_client_config.clone());
-
-    // Open 2 stuck connections → exhaust permits
-    let mut stuck_conns = Vec::new();
+    let mut sessions = Vec::new();
     for _ in 0..2 {
-        let tls =
-            open_stuck_connection(&connector, server_port, blackhole_port, &padding_md5).await;
-        stuck_conns.push(tls);
+        sessions.push(
+            open_stuck_connection(&connector, server_port, blackhole_port, &padding_md5).await,
+        );
     }
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Confirm zombie state
     assert!(
-        try_connect_tls(&tls_client_config, server_port, Duration::from_millis(500))
+        try_connect_tls(&tls_client_config, server_port, Duration::from_millis(200))
             .await
-            .is_err(),
-        "server should initially be zombie with all permits consumed"
+            .is_err()
     );
-
-    // Wait for relay_idle_timeout (2s) + margin for watchdog check interval
-    tokio::time::sleep(Duration::from_secs(4)).await;
-
-    // Server should have recovered — new connection succeeds
+    for session in &mut sessions {
+        let fin = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (h, _) = read_frame(session)
+                    .await
+                    .expect("outer session unexpectedly closed");
+                if h.command != Command::Waste {
+                    break h;
+                }
+            }
+        })
+        .await
+        .expect("idle relay did not close");
+        assert_eq!((fin.command, fin.stream_id), (Command::Fin, 1));
+        session
+            .write_all(&encode_frame(Command::Syn, 3, &[]))
+            .await
+            .unwrap();
+        let mut data = socks5_ipv4_addr([127, 0, 0, 1], echo_port);
+        data.extend_from_slice(b"recovered");
+        session
+            .write_all(&encode_frame(Command::Psh, 3, &data))
+            .await
+            .unwrap();
+        session.flush().await.unwrap();
+        loop {
+            let (h, d) = read_frame(session)
+                .await
+                .expect("session not reusable after idle relay");
+            if h.command == Command::Waste {
+                continue;
+            }
+            assert_eq!(h.stream_id, 3);
+            if h.command == Command::SynAck {
+                assert!(d.is_empty());
+                continue;
+            }
+            assert_eq!(h.command, Command::Psh);
+            assert_eq!(d, b"recovered");
+            break;
+        }
+    }
+    // max_connections still applies to idle-but-live sessions.
+    assert!(
+        try_connect_tls(&tls_client_config, server_port, Duration::from_millis(200))
+            .await
+            .is_err()
+    );
+    sessions.pop();
     assert!(
         try_connect_tls(&tls_client_config, server_port, Duration::from_secs(2))
             .await
-            .is_ok(),
-        "server should recover after relay_idle_timeout kills stuck relays"
+            .is_ok()
     );
-
-    drop(stuck_conns);
+    drop(sessions);
     blackhole_cancel.cancel();
+    echo_cancel.cancel();
     drop(blackhole_connections);
     shutdown.cancel();
 }

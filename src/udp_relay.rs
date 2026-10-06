@@ -354,7 +354,6 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
                     stream_id,
                     "UDP relay idle for {:?}, terminating", idle_timeout
                 );
-                cancel.cancel();
                 return;
             }
         }
@@ -379,6 +378,9 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
         server.stats.record_download(user_id, down);
     }
 
+    // Release cancelled PollSender reservations before waiting to enqueue FIN.
+    drop(reader);
+    drop(write_half);
     // Send FIN through the writer task channel (not directly via write_half)
     // to guarantee it arrives after all queued PSH data for this stream.
     fin_sender.send_fin().await?;

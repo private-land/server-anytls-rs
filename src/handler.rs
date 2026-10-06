@@ -110,7 +110,7 @@ pub(crate) async fn handle_connection(
             let Ok(permit) = permit else { break };
             let srv = server_clone.clone();
             let sess = session_clone.clone();
-            let cancel = cancel_clone.clone();
+            let cancel = cancel_clone.child_token();
             tokio::spawn(async move {
                 let _ = crate::outbound::handle_stream(srv, sess, stream, user_id, cancel).await;
                 drop(permit);

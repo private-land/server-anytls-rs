@@ -18,6 +18,23 @@ use crate::error::{Error, Result};
 /// Buffer size for each direction of `copy_bidirectional` relay.
 const RELAY_BUF_SIZE: usize = 32 * 1024;
 
+async fn read_socks_address(reader: &mut (impl AsyncRead + Unpin)) -> Result<Address> {
+    let mut data = [0u8; 259]; // Largest domain address: type + length + 255 + port.
+    reader.read_exact(&mut data[..1]).await?;
+    let len = match data[0] {
+        0x01 => 7,
+        0x04 => 19,
+        0x03 => {
+            reader.read_exact(&mut data[1..2]).await?;
+            4 + data[1] as usize
+        }
+        _ => return parse_socks_address(&data[..1]).map(|(addr, _)| addr),
+    };
+    let start = if data[0] == 0x03 { 2 } else { 1 };
+    reader.read_exact(&mut data[start..len]).await?;
+    parse_socks_address(&data[..len]).map(|(addr, _)| addr)
+}
+
 /// Parse a SOCKS5-style address from the given byte slice.
 /// Returns `(Address, bytes_consumed)` on success.
 pub(crate) fn parse_socks_address(data: &[u8]) -> Result<(Address, usize)> {
@@ -118,31 +135,53 @@ impl<W: AsyncRead + Unpin> AsyncRead for CountedWrite<W> {
 pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
     session: Arc<Session<T>>,
+    stream: Stream,
+    user_id: UserId,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let fin = stream.fin_sender();
+    let result = tokio::select! {
+        result = handle_stream_inner(server, session, stream, user_id, cancel.clone()) => result,
+        _ = cancel.cancelled() => return Err(Error::StreamClosed),
+    };
+    // Address parsing and dialing failures must close v1 streams too. FIN is
+    // idempotent and shares the data queue, preserving PSH-before-FIN ordering.
+    let close_result = fin.send_fin().await;
+    result?;
+    close_result?;
+    Ok(())
+}
+
+async fn handle_stream_inner<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    server: Arc<Server>,
+    session: Arc<Session<T>>,
     mut stream: Stream,
     user_id: UserId,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    // Read the first chunk from the stream to get the SOCKS5 destination address.
-    let mut buf = vec![0u8; 512];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Err(Error::StreamClosed);
-    }
-
-    let (target, consumed) = parse_socks_address(&buf[..n])?;
+    // A destination is a byte stream, not necessarily one PSH payload. Read
+    // only its bytes so any following application/UoT data stays in Stream.
+    let target = tokio::select! {
+        result = read_socks_address(&mut stream) => result?,
+        _ = cancel.cancelled() => return Err(Error::StreamClosed),
+    };
 
     // Count each stream as one request (connection is multiplexed)
     server.stats.record_request(user_id);
 
     if is_udp_over_tcp(&target) {
-        let trailing = buf[consumed..n].to_vec();
         return crate::udp_relay::handle_udp_over_tcp(
-            server, session, stream, trailing, user_id, cancel,
+            server,
+            session,
+            stream,
+            Vec::new(),
+            user_id,
+            cancel,
         )
         .await;
     }
 
-    let trailing = buf[consumed..n].to_vec();
+    let trailing = Vec::new();
     let outbound = server.router.route(&target).await;
     match outbound {
         OutboundType::Direct {
@@ -315,6 +354,7 @@ where
     // download = bytes written to stream (remote → client)
     let upload_bytes = Arc::new(AtomicU64::new(0));
     let download_bytes = Arc::new(AtomicU64::new(0));
+    let stream_shutdown = stream.shutdown_token();
 
     let mut counted_remote = CountedWrite {
         inner: remote,
@@ -342,8 +382,7 @@ where
                 prev_down = cur_down;
                 idle_since = tokio::time::Instant::now();
             } else if idle_since.elapsed() >= idle_timeout {
-                tracing::debug!("relay idle for {:?}, terminating session", idle_timeout);
-                cancel.cancel();
+                tracing::debug!("relay idle for {:?}, terminating stream", idle_timeout);
                 return;
             }
         }
@@ -360,6 +399,9 @@ where
         _ = relay => {}
         _ = idle_watchdog => {}
         _ = cancel.cancelled() => {}
+        // Remote EOF already queued an ordered FIN. Do not retain the remote
+        // socket/handler permit while an upload write remains backpressured.
+        _ = stream_shutdown.cancelled() => {}
     }
 
     // Drop the remote TCP socket immediately to free the FD.
@@ -374,10 +416,8 @@ where
         server.stats.record_download(user_id, down);
     }
 
-    // Send FIN through the writer task channel (not directly via write_half)
-    // to guarantee it arrives after all queued PSH data for this stream.
-    counted_stream.inner.send_fin().await?;
-
+    // handle_stream closes after this Stream drops, releasing any PollSender
+    // reservation left behind by a cancelled write before enqueueing FIN.
     Ok(())
 }
 
@@ -889,5 +929,47 @@ mod tests {
             Some(std::net::Ipv4Addr::new(1, 2, 3, 4)),
             "router's SSRF-checked IP must be fed to the dialer via ResolveInfo"
         );
+    }
+    #[tokio::test]
+    async fn test_remote_eof_releases_relay_when_upload_is_blocked() {
+        let server = Arc::new(
+            Server::builder()
+                .authenticator(Arc::new(SinglePasswordAuth::new("test")))
+                .router(Arc::new(DirectRouter))
+                .relay_idle_timeout(Duration::from_secs(60))
+                .build()
+                .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteCommand>(8);
+        let (data_tx, stream) = Stream::new(1, tx, 8);
+        data_tx
+            .send(bytes::Bytes::from(vec![0x55; 65536]))
+            .await
+            .unwrap();
+        // Remote closes its write half but never reads the blocked upload.
+        let (remote, mut peer) = tokio::io::duplex(64);
+        peer.shutdown().await.unwrap();
+        let mut task = tokio::spawn(async move {
+            relay_and_record(
+                server,
+                stream,
+                remote,
+                Vec::new(),
+                1,
+                CancellationToken::new(),
+            )
+            .await
+        });
+        let fin = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fin.fin, "remote EOF must enqueue FIN");
+        let result = tokio::time::timeout(Duration::from_millis(200), &mut task).await;
+        task.abort();
+        result
+            .expect("remote EOF kept relay blocked on upload")
+            .expect("relay task panicked")
+            .expect("relay returned an error");
     }
 }
