@@ -85,6 +85,25 @@ async fn https_probe(
     enabled: bool,
     exhaust_window: bool,
 ) -> Vec<usize> {
+    https_probe_profile(
+        burst_padding,
+        version,
+        matched,
+        enabled,
+        exhaust_window,
+        false,
+    )
+    .await
+}
+
+async fn https_probe_profile(
+    burst_padding: Option<bool>,
+    version: u8,
+    matched: bool,
+    enabled: bool,
+    exhaust_window: bool,
+    reference_profile: bool,
+) -> Vec<usize> {
     let (backend_tls, backend_client_tls) = tls_configs();
     let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend.local_addr().unwrap().port();
@@ -119,6 +138,7 @@ async fn https_probe(
         .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
         .router(Arc::new(DirectRouter))
         .tls_config(server_tls)
+        .auth_probe_resistance(reference_profile)
         .downlink_padding(enabled);
     if let Some(enabled) = burst_padding {
         builder = builder.downlink_burst_padding(enabled);
@@ -223,7 +243,7 @@ async fn https_probe(
         }
     }
     if exhaust_window {
-        assert_eq!(version, 2);
+        assert!(version == 2 || reference_profile);
         for _ in 0..8 {
             outer
                 .write_all(&frame(Command::HeartRequest, 0, &[]))
@@ -293,6 +313,28 @@ async fn https_probe(
     backend_task.await.unwrap();
     server_task.await.unwrap();
     lengths
+}
+
+#[tokio::test]
+async fn reference_profile_preserves_verified_https_for_v1_v2_and_switches() {
+    for version in [1, 2] {
+        for matched in [true, false] {
+            for enabled in [true, false] {
+                for exhausted in [true, false] {
+                    let lengths = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        https_probe_profile(None, version, matched, enabled, exhausted, true),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!lengths.is_empty());
+                    if version == 1 && matched && enabled && !exhausted {
+                        assert_eq!(&lengths[..3], [50, 30, 26]);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

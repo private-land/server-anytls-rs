@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use std::net::SocketAddr;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
@@ -18,14 +18,31 @@ use crate::error::{Error, Result};
 const MAX_PADDING_LEN: u16 = 1024;
 const AUTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Parse the initial ClientHello without transmitting rustls's parse-error
-/// alert. Retain unread TCP bytes when continuing the normal TLS handshake.
-async fn accept_silent_client_hello(
+/// Reject non-TLS input silently, but preserve alerts for malformed TLS.
+/// Retain unread TCP bytes when continuing the normal TLS handshake.
+async fn accept_reference_client_hello(
     tcp: TcpStream,
     config: Arc<rustls::ServerConfig>,
 ) -> Result<tokio_rustls::server::TlsStream<BufReader<TcpStream>>> {
     let mut io = BufReader::new(tcp);
+    let mut header = [0; 5];
+    io.read_exact(&mut header).await?;
+    let initial_alert = if header[0] & 0x80 != 0 {
+        Some(0x46) // SSLv2: protocol_version
+    } else if header[0] != 22 {
+        return Err(Error::InvalidFrame("not an initial TLS handshake".into()));
+    } else if u16::from_be_bytes([header[3], header[4]]) > 18432 {
+        Some(0x16) // record_overflow
+    } else {
+        None
+    };
+    if let Some(description) = initial_alert {
+        io.write_all(&[21, 3, 3, 0, 2, 2, description]).await?;
+        io.flush().await?;
+        return Err(Error::InvalidFrame("invalid initial TLS record".into()));
+    }
     let mut acceptor = rustls::server::Acceptor::default();
+    acceptor.read_tls(&mut &header[..])?;
     loop {
         let mut bytes = io.fill_buf().await?;
         if bytes.is_empty() {
@@ -42,7 +59,22 @@ async fn accept_silent_client_hello(
                 );
             }
             Ok(None) => {}
-            Err((error, _alert)) => return Err(error.into()),
+            Err((error, mut alert)) => {
+                let mut bytes = Vec::new();
+                alert.write_all(&mut bytes)?;
+                // Duplicate extensions are reported as illegal_parameter by
+                // rustls; the measured profile reports decode_error instead.
+                if matches!(
+                    error,
+                    rustls::Error::InvalidMessage(rustls::InvalidMessage::DuplicateExtension(_))
+                ) && bytes == [21, 3, 3, 0, 2, 2, 47]
+                {
+                    bytes[6] = 50;
+                }
+                io.write_all(&bytes).await?;
+                io.flush().await?;
+                return Err(error.into());
+            }
         }
     }
 }
@@ -115,8 +147,8 @@ pub(crate) async fn handle_connection(
 
     if server.config.auth_probe_resistance {
         let tls_stream = tokio::time::timeout(
-            server.config.handshake_timeout,
-            accept_silent_client_hello(tcp_stream, tls_config),
+            server.config.handshake_timeout.min(AUTH_PROBE_TIMEOUT),
+            accept_reference_client_hello(tcp_stream, tls_config),
         )
         .await
         .map_err(|_| Error::HandshakeTimeout)??;

@@ -109,6 +109,8 @@ where
 }
 
 pub struct SessionConfig {
+    /// Use measured reference settings and v1/v2 downlink record policies.
+    pub reference_profile: bool,
     pub max_streams: usize,
     pub write_cmd_capacity: usize,
     /// BufWriter buffer size for the TLS write half (bytes).
@@ -127,6 +129,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            reference_profile: false,
             max_streams: 256,
             write_cmd_capacity: 512,
             write_buf_size: DEFAULT_WRITE_BUF_SIZE,
@@ -155,6 +158,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let buf_size = config.write_buf_size;
         let downlink_padding = config.downlink_padding;
         let mut write_state = WriteState::new(write_half, buf_size, downlink_padding);
+        write_state
+            .shaper_mut()
+            .configure_reference_profile(config.reference_profile);
         write_state
             .shaper_mut()
             .configure_burst_padding(config.downlink_burst_padding);
@@ -384,7 +390,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                         let mut w = tokio::time::timeout(WRITE_TIMEOUT, self.write_half.lock())
                             .await
                             .map_err(|_| crate::error::Error::WriteTimeout)?;
-                        w.shaper_mut().enable();
+                        if self.config.reference_profile {
+                            w.shaper_mut().enable_reference_v1();
+                        } else {
+                            w.shaper_mut().enable();
+                        }
                     }
 
                     // Batch settings response frames under a single lock + flush.
@@ -491,6 +501,24 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             // timed-out flush always leaves a *complete* frame buffered.
             // With shaping disabled there is no tracked pending record.
             w.ensure_record_boundary().await?;
+            if w.needs_reference_prefix() && command != Command::Psh {
+                let mut buf = hdr_buf.to_vec();
+                buf.extend_from_slice(data);
+                if self.config.downlink_padding {
+                    let mut suffix = [0; HEADER_SIZE];
+                    FrameHeader {
+                        command: Command::Waste,
+                        stream_id: 0,
+                        length: 3,
+                    }
+                    .encode(&mut suffix);
+                    buf.extend_from_slice(&suffix);
+                    buf.extend_from_slice(&[0; 3]);
+                }
+                if w.write_reference_prefix(&buf).await? {
+                    return Ok(());
+                }
+            }
             // A `SynAck` is the head of a proxied connection's downlink burst:
             // the first bytes the peer sees for that stream, and the smallest
             // record in it. Flag it as a head so the shaper fills it up into
@@ -525,10 +553,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         .await
     }
 
-    /// Batch-write settings response frames (UpdatePaddingScheme and/or
-    /// ServerSettings) in a single lock acquisition, single write_all, and flush.
-    /// All frames are coalesced into one buffer to avoid generating separate TLS
-    /// records (each record adds ~29 bytes overhead + encryption cost).
+    /// Write settings response frames under one lock. The reference profile
+    /// preserves the initial record prefix; legacy responses remain coalesced.
     async fn write_settings_response(
         &self,
         send_padding: bool,
@@ -549,8 +575,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             None
         };
         let padding_frame_len = padding_data.map_or(0, |d| HEADER_SIZE + d.len());
+        let settings = if self.config.reference_profile {
+            &b"v=2\npd=000"[..]
+        } else {
+            &b"v=2"[..]
+        };
         let settings_frame_len = if send_server_settings {
-            HEADER_SIZE + 3
+            HEADER_SIZE + settings.len()
         } else {
             0
         };
@@ -574,12 +605,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             let header = FrameHeader {
                 command: Command::ServerSettings,
                 stream_id: 0,
-                length: 3,
+                length: settings.len() as u16,
             };
             let mut hdr_buf = [0u8; HEADER_SIZE];
             header.encode(&mut hdr_buf);
             buf.extend_from_slice(&hdr_buf);
-            buf.extend_from_slice(b"v=2");
+            buf.extend_from_slice(settings);
         }
 
         let mut w = tokio::time::timeout(WRITE_TIMEOUT, self.write_half.lock())
@@ -590,10 +621,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             // the first response. Repeated Settings never replenish its budget.
             if self.peer_version.load(Ordering::Relaxed) >= 2 {
                 w.shaper_mut().enable_v2();
+                if self.config.reference_profile && send_padding {
+                    // The first padding-scheme frame consumes the prefix;
+                    // ServerSettings follows as its own control response.
+                    let (scheme, settings) = buf.split_at(padding_frame_len);
+                    if w.write_reference_prefix(scheme).await? {
+                        if !settings.is_empty() {
+                            w.write_atomic(settings).await?;
+                            w.flush().await?;
+                        }
+                        return Ok(());
+                    }
+                } else if self.config.reference_profile && w.write_reference_prefix(&buf).await? {
+                    return Ok(());
+                }
                 w.ensure_record_boundary().await?;
                 w.write_atomic(&buf).await?;
                 w.append_control_padding().await?;
             } else {
+                if self.config.reference_profile && w.write_reference_prefix(&buf).await? {
+                    return Ok(());
+                }
                 w.write_all(&buf).await?;
             }
             w.flush().await?;

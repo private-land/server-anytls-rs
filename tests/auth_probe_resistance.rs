@@ -161,7 +161,7 @@ async fn disabled_plain_http_retains_original_tls_alert() {
 }
 
 #[tokio::test]
-async fn default_malformed_client_hello_is_silent() {
+async fn default_malformed_client_hello_returns_decode_error() {
     let fixture = Fixture::new().await;
     let mut tcp = TcpStream::connect(("127.0.0.1", fixture.port))
         .await
@@ -173,7 +173,210 @@ async fn default_malformed_client_hello_is_silent() {
         .await
         .unwrap()
         .unwrap();
-    assert!(response.is_empty());
+    assert_eq!(response, [0x15, 3, 3, 0, 2, 2, 0x32]);
+}
+
+#[tokio::test]
+async fn reference_initial_record_alerts_and_fragmentation() {
+    for (input, alert) in [
+        (vec![0x80, 9, 1, 0, 2, 0, 0, 0, 0, 0, 0], 0x46),
+        (vec![22, 3, 3, 0xff, 0xff], 0x16),
+    ] {
+        let fixture = Fixture::new().await;
+        let mut tcp = TcpStream::connect(("127.0.0.1", fixture.port))
+            .await
+            .unwrap();
+        for byte in input {
+            if tcp.write_all(&[byte]).await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut response = [0; 7];
+        tokio::time::timeout(Duration::from_secs(1), tcp.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, [0x15, 3, 3, 0, 2, 2, alert]);
+    }
+}
+
+#[tokio::test]
+async fn reference_duplicate_sni_returns_decode_error() {
+    let fixture = Fixture::new().await;
+    let mut client = rustls::ClientConnection::new(
+        fixture.client.clone(),
+        ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap();
+    let mut wire = Vec::new();
+    client.write_tls(&mut wire).unwrap();
+    let mut hello = wire[5..].to_vec();
+    let mut offset = 39 + hello[38] as usize;
+    offset += 2 + u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+    offset += 1 + hello[offset] as usize;
+    let extension_length_offset = offset;
+    offset += 2;
+    let mut duplicate = Vec::new();
+    while offset < hello.len() {
+        let length = u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+        if hello[offset..offset + 2] == [0, 0] {
+            duplicate = hello[offset..offset + 4 + length].to_vec();
+            break;
+        }
+        offset += 4 + length;
+    }
+    assert!(!duplicate.is_empty());
+    let length = u16::from_be_bytes([
+        hello[extension_length_offset],
+        hello[extension_length_offset + 1],
+    ]) + duplicate.len() as u16;
+    hello[extension_length_offset..extension_length_offset + 2]
+        .copy_from_slice(&length.to_be_bytes());
+    hello.extend_from_slice(&duplicate);
+    let handshake_length = (hello.len() - 4) as u32;
+    hello[1..4].copy_from_slice(&handshake_length.to_be_bytes()[1..]);
+    wire.truncate(5);
+    wire[3..5].copy_from_slice(&(hello.len() as u16).to_be_bytes());
+    wire.extend_from_slice(&hello);
+    let mut tcp = TcpStream::connect(("127.0.0.1", fixture.port))
+        .await
+        .unwrap();
+    tcp.write_all(&wire).await.unwrap();
+    let mut response = [0; 7];
+    tokio::time::timeout(Duration::from_secs(1), tcp.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response, [21, 3, 3, 0, 2, 2, 50]);
+}
+
+#[tokio::test]
+async fn early_ticket_does_not_admit_corrupt_client_finished() {
+    let fixture = Fixture::new().await;
+    let mut client = rustls::ClientConnection::new(
+        fixture.client.clone(),
+        ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap();
+    let mut tcp = TcpStream::connect(("127.0.0.1", fixture.port))
+        .await
+        .unwrap();
+    let mut wire = Vec::new();
+    client.write_tls(&mut wire).unwrap();
+    tcp.write_all(&wire).await.unwrap();
+    while client.is_handshaking() {
+        let mut header = [0; 5];
+        tcp.read_exact(&mut header).await.unwrap();
+        let mut record = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+        tcp.read_exact(&mut record).await.unwrap();
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(&record);
+        client.read_tls(&mut &bytes[..]).unwrap();
+        client.process_new_packets().unwrap();
+    }
+    wire.clear();
+    client.write_tls(&mut wire).unwrap();
+    let mut offset = 0;
+    let mut corrupted = false;
+    while offset < wire.len() {
+        let end = offset + 5 + u16::from_be_bytes([wire[offset + 3], wire[offset + 4]]) as usize;
+        if wire[offset] == 23 {
+            wire[end - 1] ^= 1;
+            corrupted = true;
+            break;
+        }
+        offset = end;
+    }
+    assert!(corrupted);
+    tcp.write_all(&wire).await.unwrap();
+    let mut rejected = false;
+    for _ in 0..2 {
+        let mut header = [0; 5];
+        tokio::time::timeout(Duration::from_secs(1), tcp.read_exact(&mut header))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut record = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+        tcp.read_exact(&mut record).await.unwrap();
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(&record);
+        client.read_tls(&mut &bytes[..]).unwrap();
+        if let Err(error) = client.process_new_packets() {
+            assert!(matches!(
+                error,
+                rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac)
+            ));
+            rejected = true;
+            break;
+        }
+    }
+    assert!(rejected);
+    // The failed TLS handshake releases the only permit; it cannot create an
+    // authenticated session merely because the server already issued a ticket.
+    let _valid = fixture.tls().await;
+}
+
+#[tokio::test]
+async fn reference_handshake_deadline_is_five_seconds() {
+    let fixture = Fixture::new().await;
+    let mut tcp = TcpStream::connect(("127.0.0.1", fixture.port))
+        .await
+        .unwrap();
+    tcp.write_all(&[22, 3, 3]).await.unwrap();
+    let start = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(6), closed(&mut tcp))
+        .await
+        .expect("partial TLS exceeded five seconds");
+    assert!(start.elapsed() >= Duration::from_millis(4700));
+}
+
+#[tokio::test]
+async fn reference_and_legacy_tls13_first_flights() {
+    for enabled in [true, false] {
+        let fixture = Fixture::with_policy(Some(enabled)).await;
+        let mut client = rustls::ClientConnection::new(
+            fixture.client.clone(),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        let mut tcp = TcpStream::connect(("127.0.0.1", fixture.port))
+            .await
+            .unwrap();
+        tcp.write_all(&hello).await.unwrap();
+        let mut encrypted = 0;
+        let mut extensions = Vec::new();
+        // Four handshake records plus one application-key ticket, without
+        // sending the client's Finished. Legacy waits to issue tickets.
+        let expected = if enabled { 5 } else { 1 };
+        while encrypted < expected {
+            let mut header = [0; 5];
+            tokio::time::timeout(Duration::from_secs(1), tcp.read_exact(&mut header))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut payload = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+            tcp.read_exact(&mut payload).await.unwrap();
+            if header[0] == 23 {
+                encrypted += 1;
+            }
+            if header[0] == 22 {
+                let sid_len = payload[38] as usize;
+                let mut offset = 44 + sid_len;
+                while offset < payload.len() {
+                    extensions.push(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
+                    offset +=
+                        4 + u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]) as usize;
+                }
+            }
+        }
+        assert_eq!(
+            extensions,
+            if enabled { vec![43, 51] } else { vec![51, 43] }
+        );
+    }
 }
 
 #[tokio::test]

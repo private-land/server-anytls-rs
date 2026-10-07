@@ -58,7 +58,7 @@ All arguments support environment variables with `X_PANDA_ANYTLS_` prefix.
 | `--stream_channel_capacity` | `128` | Per-stream data channel capacity (number of buffered messages). |
 | `--downlink_padding` | `true` | Server-side downlink shaping for protocol v1/v2. v2 uses a bounded session-level early window, then normal bulk buffering; controls retain a 10-byte Waste suffix. v1 retains split/head-fill shaping. Set `false` for an unshaped control. |
 | `--downlink_burst_padding` | `true` | v2: substantial fill during the first 8 non-empty flush attempts, capped at 8 KiB per outer session. v1: at most 3 seconds / 8 records / 2 KiB after outbound success. Requires `--downlink_padding true`. Set `false` to disable substantial v2 early fill while retaining its small control suffix, or retain only v1 split/head-fill. |
-| `--auth_probe_resistance` | `true` | Silently reject malformed initial TLS input and close failed/incomplete authentication at a shared 5-second deadline after TLS handshake completion. Successful authentication proceeds immediately. Set `false` to retain the original handshake/authentication path. |
+| `--auth_probe_resistance` | `true` | Reference TLS rejection, handshake record organization, v1/v2 downlink shaping and separate five-second TLS/authentication deadlines. Set `false` to retain the original behavior. Certificates are unchanged. |
 | `--refresh_geodata` | `false` | Force refresh ACL geodata |
 
 Authentication probe resistance is enabled by default. Disable it with
@@ -67,17 +67,40 @@ Authentication probe resistance is enabled by default. Disable it with
 incomplete or rejected authentication closes at the same five-second deadline;
 later input cannot extend it. A peer that disconnects releases the connection
 early. Valid authentication proceeds immediately, including coalesced Settings.
-Malformed initial input, including plaintext HTTP, is silently rejected before
-accepting a ClientHello. Subsequent TLS negotiation retains rustls's normal
-error handling. The TLS handshake retains its separate bounded timeout. With
+Plaintext HTTP and initial non-handshake records are silently rejected.
+Malformed ClientHello inputs receive TLS alerts, including `decode_error` for
+duplicate extensions, `protocol_version` for SSLv2, and `record_overflow` for
+oversized initial records. The TLS handshake has a separate five-second limit
+(or a shorter explicitly configured limit). TLS 1.3 handshake messages use
+separate records, ServerHello encodes supported_versions before key_share, and
+at most one session ticket is issued. Explicitly disabled tickets remain off.
+With no TLS client authentication or 0-RTT configured, one ticket follows the
+server Finished immediately, as permitted by RFC 8446 section 4.6.1. The client
+Finished is still verified before authentication or session traffic is admitted.
+Ticket encryption and lifetime retain upstream behavior; opaque ticket lengths
+are not copied.
+With
 the option disabled, TLS handshake and authentication use the original shared
 timeout, failed password checks close immediately, and TLS parse alerts are
-unchanged. This option does not modify padding or establish censorship resistance.
+unchanged. No certificates are replaced in either mode. These changes align
+measured behavior and do not establish censorship resistance.
 
 Early downlink padding is enabled by default. Disable it with
 `--downlink_burst_padding false` or
 `X_PANDA_ANYTLS_DOWNLINK_BURST_PADDING=false`. The client's padding scheme and
-MD5 do not change. For v2, Settings, heartbeat replies, SynAck, data and FIN
+MD5 do not change. With the reference profile enabled, both v1 and v2 use a
+one-time 33/13/9-byte plaintext prefix (TLS 1.3 ciphertext 50/30/26 bytes).
+Long initial frames cross these records without inserting Waste inside a frame.
+v2 ServerSettings announces `v=2\npd=000`; the extra field is informational,
+with no assumed client-side semantics. Matching settings do not consume the
+six subsequent 500–1000-byte substantial-padding flush attempts; a mismatching
+scheme is sent first, then ServerSettings consumes one of those attempts.
+The window is shared by the session, never resets on new streams or repeated
+Settings, and has an 8 KiB substantial-padding budget. Control replies retain
+a ten-byte Waste suffix after the window. The main padding switch disables
+the prefix and all Waste; the burst switch disables substantial fill only.
+
+With the reference profile disabled, v2 Settings, heartbeat replies, SynAck, data and FIN
 share one non-renewable window: the first eight non-empty plaintext flush
 attempts target 500–1000 bytes. The window does not expire with time, and new
 streams or repeated Settings cannot replenish it. After the window, bulk data
@@ -88,7 +111,7 @@ the session; ordinary data writes have no permanent suffix.
 
 The v2 policy follows observed reference-server behavior, rather than a known
 copy of its internal algorithm. Plaintext flushes are not necessarily individual
-TLS records. v1 retains its existing per-stream early window and continuous
+TLS records. In legacy mode, v1 retains its existing per-stream early window and continuous
 split/head-fill policy. These policies do not deliberately delay writes or
 remove directional/timing correlations, and do not establish censorship resistance.
 
@@ -98,6 +121,12 @@ latency, overhead, and IP survival on a canary before enabling it across a fleet
 flow through two real TLS layers and compares encrypted outer record lengths
 with this option enabled and disabled. The fixture models a short response; it
 does not reproduce Gstatic's exact certificates, tickets, or response headers.
+
+For native-client capture without a panel, run `cargo run --example probe_profile
+-- --cert /path/to/cert.pem --key /path/to/key.pem --password test-password`.
+The endpoint listens on localhost and preserves the supplied certificate.
+Add `--reference-profile false` to compare the legacy path. Only use test
+credentials with this local diagnostic endpoint.
 
 ## Benchmark: Rust vs Go
 

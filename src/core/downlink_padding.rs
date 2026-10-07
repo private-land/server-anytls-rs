@@ -1,5 +1,10 @@
 //! Server-side downlink padding using protocol-compatible Waste frames.
 //!
+//! The reference profile uses a one-time 33/13/9-byte plaintext prefix and
+//! six substantial flush attempts for v1/v2. It preserves complete frame
+//! streams across record splits and never replenishes its session window.
+//! The legacy policies below apply when that profile is disabled.
+//!
 //! v2 uses a non-renewable window shared by the entire outer session: the
 //! first eight non-empty plaintext flush attempts target 500–1000 bytes, with
 //! at most 8 KiB of substantial padding. Settings, heartbeats, control frames
@@ -149,6 +154,8 @@ pub struct DownlinkShaper {
     v2_records: usize,
     v2_budget: usize,
     capacity: usize,
+    reference_profile: bool,
+    reference_prefix: bool,
 }
 
 impl DownlinkShaper {
@@ -186,6 +193,8 @@ impl DownlinkShaper {
             v2_records: 0,
             v2_budget: 0,
             capacity: buf_capacity.max(1),
+            reference_profile: false,
+            reference_prefix: false,
         };
         shaper.pick_target();
         shaper
@@ -200,13 +209,26 @@ impl DownlinkShaper {
         self.enabled = self.configured;
     }
 
+    pub fn configure_reference_profile(&mut self, enabled: bool) {
+        self.reference_profile = enabled;
+        self.reference_prefix = enabled;
+    }
+
+    pub fn enable_reference_v1(&mut self) {
+        self.enable_v2();
+    }
+
     /// Select v2 once, before its first response. Repeated Settings must not
     /// reset the counter or budget; outbound success cannot re-arm this policy.
     pub fn enable_v2(&mut self) {
         self.enable();
         if !self.v2_policy {
             self.v2_policy = true;
-            self.v2_records = V2_EARLY_RECORDS;
+            self.v2_records = if self.reference_profile {
+                6
+            } else {
+                V2_EARLY_RECORDS
+            };
             self.v2_budget = V2_PADDING_BUDGET;
             self.head = false;
             self.pick_target();
@@ -477,6 +499,10 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
         &mut self.shaper
     }
 
+    pub fn needs_reference_prefix(&self) -> bool {
+        self.shaper.reference_profile && self.shaper.reference_prefix && self.shaper.is_enabled()
+    }
+
     /// Write framed bytes, ending the current TLS record whenever it reaches the
     /// shaper's target size.
     ///
@@ -488,6 +514,9 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
     /// mid-frame, and padding behind a partial frame would desynchronise the
     /// peer's frame parser.
     pub async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if !buf.is_empty() && self.write_reference_prefix(buf).await? {
+            return Ok(());
+        }
         let mut rest = buf;
         while !rest.is_empty() {
             let n = self.shaper.write_budget().min(rest.len());
@@ -532,6 +561,41 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
         self.w.write_all(buf).await?;
         self.shaper.account(buf.len());
         Ok(())
+    }
+
+    /// Emit the measured one-time 33/13/9-byte prefix. Frames may cross TLS
+    /// records, but Waste is appended only after the entire frame is written.
+    /// Mark it spent before I/O: failed writes must never re-arm the prefix.
+    pub async fn write_reference_prefix(&mut self, buf: &[u8]) -> io::Result<bool> {
+        if !self.needs_reference_prefix() {
+            return Ok(false);
+        }
+        self.ensure_record_boundary().await?;
+        self.shaper.reference_prefix = false;
+        let mut offset = 0;
+        for target in [33, 13, 9] {
+            let count = target.min(buf.len().saturating_sub(offset));
+            if count > 0 {
+                self.write_atomic(&buf[offset..offset + count]).await?;
+                offset += count;
+            }
+            let padding = target - count;
+            // All observed control/settings frames leave enough room for a
+            // complete Waste header. Otherwise retain the short record.
+            if padding >= HEADER_SIZE {
+                write_waste(&mut self.w, padding).await?;
+                self.shaper.account(padding);
+                self.pending_padding += padding;
+            }
+            self.w.flush().await?;
+            self.finish_record();
+        }
+        if offset < buf.len() {
+            self.write_atomic(&buf[offset..]).await?;
+            self.w.flush().await?;
+            self.finish_record();
+        }
+        Ok(true)
     }
 
     /// Append the small v2 control suffix at a complete frame boundary.
@@ -622,6 +686,70 @@ mod tests {
 
     /// Test capacity, matching the production default.
     const CAP: usize = 32 * 1024;
+
+    #[tokio::test]
+    async fn reference_control_prefix_and_six_early_replies_preserve_frames() {
+        for version in [1, 2] {
+            let (mut ws, log) = setup(true);
+            ws.shaper_mut().configure_reference_profile(true);
+            ws.shaper_mut().configure_burst_padding(true);
+            if version == 1 {
+                ws.shaper_mut().enable_reference_v1();
+            } else {
+                ws.shaper_mut().enable_v2();
+            }
+            let initial = if version == 2 {
+                frame(Command::ServerSettings, 0, 10)
+            } else {
+                let mut bytes = frame(Command::HeartResponse, 1, 0);
+                bytes.extend_from_slice(&frame(Command::Waste, 0, 3));
+                bytes
+            };
+            assert!(ws.write_reference_prefix(&initial).await.unwrap());
+            assert_eq!(log.sizes(), [33, 13, 9]);
+            for id in 2..=8 {
+                ws.write_atomic(&frame(Command::HeartResponse, id, 0))
+                    .await
+                    .unwrap();
+                ws.append_control_padding().await.unwrap();
+                ws.flush().await.unwrap();
+            }
+            let sizes = log.sizes();
+            assert!(sizes[3..9].iter().all(|n| (500..=1000).contains(n)));
+            assert_eq!(sizes[9], 17);
+            ws.shaper_mut().start_burst_padding();
+            ws.shaper_mut().enable_v2();
+            ws.write_atomic(&frame(Command::HeartResponse, 9, 0))
+                .await
+                .unwrap();
+            ws.append_control_padding().await.unwrap();
+            ws.flush().await.unwrap();
+            assert_eq!(log.sizes()[10], 17);
+            let frames = parse_frames(&log.stream());
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|(c, _)| *c == Command::HeartResponse)
+                    .count(),
+                if version == 1 { 9 } else { 8 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_scheme_split_has_no_padding_inside_frame() {
+        let (mut ws, log) = setup(true);
+        ws.shaper_mut().configure_reference_profile(true);
+        ws.shaper_mut().enable_v2();
+        let scheme = frame(Command::UpdatePaddingScheme, 0, 177);
+        assert!(ws.write_reference_prefix(&scheme).await.unwrap());
+        assert_eq!(log.sizes(), [33, 13, 9, 129]);
+        assert_eq!(log.stream(), scheme);
+        assert_eq!(
+            parse_frames(&log.stream()),
+            [(Command::UpdatePaddingScheme, 177)]
+        );
+    }
 
     /// A writer that records the plaintext size of every `poll_write` call.
     /// With a `BufWriter` in front, one `poll_write` == one emitted TLS record.

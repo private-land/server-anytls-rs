@@ -1,6 +1,6 @@
 [package]
 name = "server-anytls-rs"
-version = "0.1.53"
+version = "0.1.54"
 edition = "2024"
 
 [[bin]]
@@ -42,10 +42,13 @@ panel-connect-rpc = { git = "https://github.com/private-land/server-panel-rs", t
 socket2 = "0.6"
 libc = "0.2"
 
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }
+
 [dev-dependencies]
+rcgen = "0.14.7"
 tokio-test = "0.4"
 criterion = { version = "0.8", features = ["async_tokio"] }
-rcgen = "0.14.7"
 tempfile = "3"
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1", features = ["test-utils"] }
 

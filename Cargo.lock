@@ -2001,8 +2001,6 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.43"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -2200,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "server-anytls-rs"
-version = "0.1.53"
+version = "0.1.54"
 dependencies = [
  "acl-engine-rs",
  "anyhow",

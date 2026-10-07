@@ -164,8 +164,8 @@ pub struct CliArgs {
     )]
     pub downlink_burst_padding: bool,
 
-    /// Uniform five-second authentication deadline and silent rejection of
-    /// malformed initial TLS input. Set false to retain legacy behavior.
+    /// Reference TLS rejection, five-second deadlines and v1/v2 downlink
+    /// record policies. Set false to retain legacy behavior.
     #[arg(
         long,
         visible_alias = "auth-probe-resistance",

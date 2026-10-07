@@ -38,8 +38,8 @@ pub struct ServerConfig {
     pub max_streams_per_session: usize,
     pub tcp_connect_timeout: Duration,
     pub handshake_timeout: Duration,
-    /// Use a five-second authentication deadline and silently reject malformed
-    /// initial TLS input. Disable to retain the original handshake/auth path.
+    /// Align TLS rejection, handshake records and session padding with the
+    /// measured reference profile. Disable to retain the legacy path.
     pub auth_probe_resistance: bool,
     /// BufWriter buffer size for the TLS write half (bytes).
     pub write_buf_size: usize,
@@ -104,6 +104,7 @@ impl Server {
             write_buf_size: self.config.write_buf_size,
             downlink_padding: self.config.downlink_padding,
             downlink_burst_padding: self.config.downlink_burst_padding,
+            reference_profile: self.config.auth_probe_resistance,
             stream_channel_capacity: self.config.stream_channel_capacity,
             ..SessionConfig::default()
         }
@@ -320,6 +321,11 @@ impl ServerBuilder {
         let semaphore = Arc::new(Semaphore::new(config.max_connections));
 
         let tls_config = self.tls_config.map(|mut tls| {
+            tls.reference_server_profile = self.auth_probe_resistance;
+            if self.auth_probe_resistance {
+                tls.send_tls13_tickets = tls.send_tls13_tickets.min(1);
+                tls.max_tls13_tickets = 0;
+            }
             // Enable session tickets for TLS resumption — avoids a full
             // handshake on reconnect, reducing latency by 1-RTT.
             match rustls::crypto::aws_lc_rs::Ticketer::new() {
