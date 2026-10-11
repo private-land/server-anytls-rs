@@ -501,24 +501,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             // timed-out flush always leaves a *complete* frame buffered.
             // With shaping disabled there is no tracked pending record.
             w.ensure_record_boundary().await?;
-            if w.needs_reference_prefix() && command != Command::Psh {
-                let mut buf = hdr_buf.to_vec();
-                buf.extend_from_slice(data);
-                if self.config.downlink_padding {
-                    let mut suffix = [0; HEADER_SIZE];
-                    FrameHeader {
-                        command: Command::Waste,
-                        stream_id: 0,
-                        length: 3,
-                    }
-                    .encode(&mut suffix);
-                    buf.extend_from_slice(&suffix);
-                    buf.extend_from_slice(&[0; 3]);
-                }
-                if w.write_reference_prefix(&buf).await? {
-                    return Ok(());
-                }
-            }
             // A `SynAck` is the head of a proxied connection's downlink burst:
             // the first bytes the peer sees for that stream, and the smallest
             // record in it. Flag it as a head so the shaper fills it up into
@@ -553,8 +535,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         .await
     }
 
-    /// Write settings response frames under one lock. The reference profile
-    /// preserves the initial record prefix; legacy responses remain coalesced.
+    /// Coalesce settings response frames under one lock and flush immediately.
     async fn write_settings_response(
         &self,
         send_padding: bool,
@@ -621,29 +602,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             // the first response. Repeated Settings never replenish its budget.
             if self.peer_version.load(Ordering::Relaxed) >= 2 {
                 w.shaper_mut().enable_v2();
-                if self.config.reference_profile && send_padding {
-                    // The first padding-scheme frame consumes the prefix;
-                    // ServerSettings follows as its own control response.
-                    let (scheme, settings) = buf.split_at(padding_frame_len);
-                    if w.write_reference_prefix(scheme).await? {
-                        if !settings.is_empty() {
-                            w.write_atomic(settings).await?;
-                            w.flush().await?;
-                        }
-                        return Ok(());
-                    }
-                } else if self.config.reference_profile && w.write_reference_prefix(&buf).await? {
-                    return Ok(());
-                }
                 w.ensure_record_boundary().await?;
                 w.write_atomic(&buf).await?;
-                w.append_control_padding().await?;
             } else {
-                if self.config.reference_profile && w.write_reference_prefix(&buf).await? {
-                    return Ok(());
-                }
                 w.write_all(&buf).await?;
             }
+            w.append_control_padding().await?;
             w.flush().await?;
             Ok(())
         })
@@ -685,6 +649,41 @@ mod tests {
 
     fn test_padding() -> PaddingFactory {
         PaddingFactory::new(DEFAULT_SCHEME).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reference_v1_scheme_reply_has_bounded_control_padding_without_burst_fill() {
+        let (mut client, server) = duplex(8192);
+        let session = Session::new_server(
+            server,
+            test_padding(),
+            SessionConfig {
+                reference_profile: true,
+                downlink_burst_padding: false,
+                ..SessionConfig::default()
+            },
+        );
+        session.peer_version.store(1, Ordering::Relaxed);
+        session
+            .write_half
+            .lock()
+            .await
+            .shaper_mut()
+            .enable_reference_v1();
+        session.write_settings_response(true, false).await.unwrap();
+        let mut bytes = [0; 8192];
+        let n = client.read(&mut bytes).await.unwrap();
+        let scheme_len = HEADER_SIZE + session.padding.raw_scheme().len();
+        assert!(
+            (16..=64).contains(&(n - scheme_len)),
+            "v1 scheme reply has no bounded random control padding"
+        );
+        let mut header = [0; HEADER_SIZE];
+        header.copy_from_slice(&bytes[scheme_len..scheme_len + HEADER_SIZE]);
+        let waste = FrameHeader::decode(&header);
+        assert_eq!(waste.command, Command::Waste);
+        assert_eq!(waste.stream_id, 0);
+        assert_eq!(scheme_len + HEADER_SIZE + waste.length as usize, n);
     }
 
     // Helper: write a frame to an AsyncWrite
@@ -733,22 +732,26 @@ mod tests {
             if reply < 8 {
                 assert!((500..=1000).contains(&n), "early heartbeat {reply}: {n}");
             } else {
-                assert_eq!(
-                    n, 17,
-                    "late control must carry only a ten-byte Waste suffix"
+                assert!(
+                    (7..=71).contains(&n),
+                    "late control was substantially filled: {n}"
                 );
             }
         }
         for sid in [1, 3, 5] {
             session.handshake_success(sid).await.unwrap();
             let n = client.read(&mut first).await.unwrap();
-            assert_eq!(n, 17, "reused stream replenished padding");
+            assert!(
+                (7..=71).contains(&n),
+                "reused stream replenished early padding: {n}"
+            );
         }
         // Repeated settings must not replenish the window either.
         session.write_settings_response(false, true).await.unwrap();
         let n = client.read(&mut first).await.unwrap();
-        assert_eq!(n, 20);
-        assert!(session.shaping_stats().padded <= 8192 + 14 * 10);
+        assert!((10..=74).contains(&n));
+        let stats = session.shaping_stats();
+        assert!(stats.padded <= 8192 + 1024 + stats.real_bytes() / 100);
         drop(client);
         let _ = task.await;
     }
@@ -1256,7 +1259,10 @@ mod tests {
             "Waste payload must be zero-filled"
         );
 
-        assert_eq!(waste_payload, 3, "v2 control suffix payload");
+        assert!(
+            (9..=57).contains(&waste_payload),
+            "random control padding payload {waste_payload}"
+        );
         client_io.read_exact(&mut waste_hdr).await.unwrap();
         let fill = FrameHeader::decode(&waste_hdr);
         assert_eq!(fill.command, Command::Waste);

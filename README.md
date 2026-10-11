@@ -56,8 +56,8 @@ All arguments support environment variables with `X_PANDA_ANYTLS_` prefix.
 | `--max_connections` | `auto` | Global connection limit. `auto` derives a cap from `min(cpu_throughput, ram_budget, fd_limit)`; pass a positive integer to override. |
 | `--write_buf_size` | `32768` | BufWriter buffer size for the TLS write half, in bytes. |
 | `--stream_channel_capacity` | `128` | Per-stream data channel capacity (number of buffered messages). |
-| `--downlink_padding` | `true` | Server-side downlink shaping for protocol v1/v2. v2 uses a bounded session-level early window, then normal bulk buffering; controls retain a 10-byte Waste suffix. v1 retains split/head-fill shaping. Set `false` for an unshaped control. |
-| `--downlink_burst_padding` | `true` | v2: substantial fill during the first 8 non-empty flush attempts, capped at 8 KiB per outer session. v1: at most 3 seconds / 8 records / 2 KiB after outbound success. Requires `--downlink_padding true`. Set `false` to disable substantial v2 early fill while retaining its small control suffix, or retain only v1 split/head-fill. |
+| `--downlink_padding` | `true` | Server-side downlink shaping for protocol v1/v2. v2 uses a bounded session-level early window, then normal bulk buffering; control Waste is randomized and capped by a separate session budget. Legacy v1 retains split/head-fill shaping. Set `false` for an unshaped control. |
+| `--downlink_burst_padding` | `true` | Reference v1/v2: the first 6 non-empty flush attempts, capped at 8 KiB per session. Legacy v2: 8 attempts / 8 KiB per session. Legacy v1: at most 3 seconds / 8 records / 2 KiB after outbound success. Requires `--downlink_padding true`. Set `false` to disable substantial early fill while retaining bounded control padding or legacy v1 split/head-fill. |
 | `--auth_probe_resistance` | `true` | Reference TLS rejection, handshake record organization, v1/v2 downlink shaping and separate five-second TLS/authentication deadlines. Set `false` to retain the original behavior. Certificates are unchanged. |
 | `--refresh_geodata` | `false` | Force refresh ACL geodata |
 
@@ -88,29 +88,33 @@ measured behavior and do not establish censorship resistance.
 Early downlink padding is enabled by default. Disable it with
 `--downlink_burst_padding false` or
 `X_PANDA_ANYTLS_DOWNLINK_BURST_PADDING=false`. The client's padding scheme and
-MD5 do not change. With the reference profile enabled, both v1 and v2 use a
-one-time 33/13/9-byte plaintext prefix (TLS 1.3 ciphertext 50/30/26 bytes).
-Long initial frames cross these records without inserting Waste inside a frame.
+MD5 do not change. With the reference profile enabled, both v1 and v2 use
+six 500–1000-byte substantial-padding flush attempts, without a fixed prefix.
 v2 ServerSettings announces `v=2\npd=000`; the extra field is informational,
-with no assumed client-side semantics. Matching settings do not consume the
-six subsequent 500–1000-byte substantial-padding flush attempts; a mismatching
-scheme is sent first, then ServerSettings consumes one of those attempts.
+with no assumed client-side semantics. The initial settings response consumes
+one attempt; a padding-scheme update and ServerSettings share the same flush.
 The window is shared by the session, never resets on new streams or repeated
-Settings, and has an 8 KiB substantial-padding budget. Control replies retain
-a ten-byte Waste suffix after the window. The main padding switch disables
-the prefix and all Waste; the burst switch disables substantial fill only.
+Settings, and has an 8 KiB substantial-padding budget. The main padding switch
+disables all Waste; the burst switch disables substantial fill only.
 
 With the reference profile disabled, v2 Settings, heartbeat replies, SynAck, data and FIN
 share one non-renewable window: the first eight non-empty plaintext flush
 attempts target 500–1000 bytes. The window does not expire with time, and new
 streams or repeated Settings cannot replenish it. After the window, bulk data
-uses normal buffering and TLS fragmentation; control frames keep only the
-10-byte Waste suffix. That suffix is accounted separately from the 8 KiB
-substantial-padding limit. It adds 10 bytes per control frame for the life of
-the session; ordinary data writes have no permanent suffix.
+uses normal buffering and TLS fragmentation. Reference v1/v2 and legacy v2
+control frames append 16–64 bytes of randomized Waste, including its seven-byte
+header. This padding has a separate non-renewable session allowance of 1 KiB
+plus 1% of non-padding AnyTLS plaintext sent (including frame headers); it does
+not count padding as useful traffic. Remaining credit and buffer space may
+shorten the Waste frame or omit it. New streams and repeated Settings cannot
+reset the allowance. Credit is reserved before I/O, including failed/cancelled
+writes. This cap applies to control padding, not the existing 8 KiB early fill
+or TLS/TCP framing overhead. Ordinary data writes have no permanent suffix.
+Control padding shares the existing flush, never waits to collect data, and
+never generates an idle record.
 
-The v2 policy follows observed reference-server behavior, rather than a known
-copy of its internal algorithm. Plaintext flushes are not necessarily individual
+The early-window policy follows observed reference-server behavior, rather than
+a known copy of its internal algorithm. Plaintext flushes are not necessarily individual
 TLS records. In legacy mode, v1 retains its existing per-stream early window and continuous
 split/head-fill policy. These policies do not deliberately delay writes or
 remove directional/timing correlations, and do not establish censorship resistance.

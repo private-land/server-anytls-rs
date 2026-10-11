@@ -329,7 +329,11 @@ async fn reference_profile_preserves_verified_https_for_v1_v2_and_switches() {
                     .unwrap();
                     assert!(!lengths.is_empty());
                     if version == 1 && matched && enabled && !exhausted {
-                        assert_eq!(&lengths[..3], [50, 30, 26]);
+                        assert_ne!(
+                            &lengths[..3],
+                            [50, 30, 26],
+                            "fixed reference prefix remains on the TLS wire"
+                        );
                     }
                 }
             }

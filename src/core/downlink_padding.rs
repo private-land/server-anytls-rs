@@ -1,8 +1,8 @@
 //! Server-side downlink padding using protocol-compatible Waste frames.
 //!
-//! The reference profile uses a one-time 33/13/9-byte plaintext prefix and
-//! six substantial flush attempts for v1/v2. It preserves complete frame
-//! streams across record splits and never replenishes its session window.
+//! The reference profile uses six substantial flush attempts for v1/v2,
+//! without a fixed plaintext prefix. It preserves complete frame streams
+//! across record splits and never replenishes its session window.
 //! The legacy policies below apply when that profile is disabled.
 //!
 //! v2 uses a non-renewable window shared by the entire outer session: the
@@ -10,8 +10,10 @@
 //! at most 8 KiB of substantial padding. Settings, heartbeats, control frames
 //! and data all consume the same counter. There is no time expiry or reset on
 //! stream reuse. After the window, bulk writes use normal buffering and TLS
-//! fragmentation. Control frames retain a three-byte Waste payload (ten bytes
-//! including its header), accounted separately from the substantial budget.
+//! fragmentation. Control frames use 16–64 bytes of randomized Waste padding
+//! including its header, with a separate session allowance of 1 KiB plus 1%
+//! of non-padding plaintext. Small remaining budgets/buffers shorten or skip
+//! the padding; it never requires an additional flush or an idle write.
 //!
 //! This policy follows observed reference-server behavior; it does not recover
 //! that server's internal implementation or establish censorship resistance.
@@ -69,7 +71,9 @@ const BURST_HEAD_MAX: usize = 768;
 /// v2 uses a single non-renewable window for the outer session.
 const V2_EARLY_RECORDS: usize = 8;
 const V2_PADDING_BUDGET: usize = 8192;
-const V2_CONTROL_PADDING: usize = HEADER_SIZE + 3;
+const CONTROL_PADDING_MIN: usize = 16;
+const CONTROL_PADDING_MAX: usize = 64;
+const CONTROL_PADDING_BOOTSTRAP: u64 = 1024;
 
 /// A `Waste` frame is `HEADER_SIZE` bytes of header plus a payload; the
 /// smallest useful one is a bare header.
@@ -155,7 +159,7 @@ pub struct DownlinkShaper {
     v2_budget: usize,
     capacity: usize,
     reference_profile: bool,
-    reference_prefix: bool,
+    control_padding_spent: u64,
 }
 
 impl DownlinkShaper {
@@ -194,7 +198,7 @@ impl DownlinkShaper {
             v2_budget: 0,
             capacity: buf_capacity.max(1),
             reference_profile: false,
-            reference_prefix: false,
+            control_padding_spent: 0,
         };
         shaper.pick_target();
         shaper
@@ -211,7 +215,6 @@ impl DownlinkShaper {
 
     pub fn configure_reference_profile(&mut self, enabled: bool) {
         self.reference_profile = enabled;
-        self.reference_prefix = enabled;
     }
 
     pub fn enable_reference_v1(&mut self) {
@@ -378,6 +381,33 @@ impl DownlinkShaper {
         }
     }
 
+    fn control_padding(&mut self, pending_padding: usize) -> usize {
+        if !self.enabled || !self.v2_policy || self.pending == 0 {
+            return 0;
+        }
+        let real_bytes = self
+            .counters
+            .snapshot()
+            .real_bytes()
+            .saturating_add(self.pending.saturating_sub(pending_padding) as u64);
+        let allowance = CONTROL_PADDING_BOOTSTRAP.saturating_add(real_bytes / 100);
+        let remaining = allowance.saturating_sub(self.control_padding_spent);
+        let available = self
+            .capacity
+            .saturating_sub(self.pending)
+            .min(remaining.min(CONTROL_PADDING_MAX as u64) as usize);
+        if available < MIN_WASTE_FRAME {
+            return 0;
+        }
+        let padding = self
+            .range(CONTROL_PADDING_MIN, CONTROL_PADDING_MAX)
+            .min(available);
+        // Reserve before I/O so failed/cancelled writes cannot reuse credit.
+        // Only real plaintext earns credit; padding never funds more padding.
+        self.control_padding_spent += padding as u64;
+        padding
+    }
+
     /// Mark the next record as a burst head: the session start, or the head of
     /// a proxied connection's downlink (`SynAck` for v2, first data for v1).
     pub fn mark_burst_head(&mut self) {
@@ -499,10 +529,6 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
         &mut self.shaper
     }
 
-    pub fn needs_reference_prefix(&self) -> bool {
-        self.shaper.reference_profile && self.shaper.reference_prefix && self.shaper.is_enabled()
-    }
-
     /// Write framed bytes, ending the current TLS record whenever it reaches the
     /// shaper's target size.
     ///
@@ -514,9 +540,6 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
     /// mid-frame, and padding behind a partial frame would desynchronise the
     /// peer's frame parser.
     pub async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        if !buf.is_empty() && self.write_reference_prefix(buf).await? {
-            return Ok(());
-        }
         let mut rest = buf;
         while !rest.is_empty() {
             let n = self.shaper.write_budget().min(rest.len());
@@ -563,53 +586,14 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
         Ok(())
     }
 
-    /// Emit the measured one-time 33/13/9-byte prefix. Frames may cross TLS
-    /// records, but Waste is appended only after the entire frame is written.
-    /// Mark it spent before I/O: failed writes must never re-arm the prefix.
-    pub async fn write_reference_prefix(&mut self, buf: &[u8]) -> io::Result<bool> {
-        if !self.needs_reference_prefix() {
-            return Ok(false);
-        }
-        self.ensure_record_boundary().await?;
-        self.shaper.reference_prefix = false;
-        let mut offset = 0;
-        for target in [33, 13, 9] {
-            let count = target.min(buf.len().saturating_sub(offset));
-            if count > 0 {
-                self.write_atomic(&buf[offset..offset + count]).await?;
-                offset += count;
-            }
-            let padding = target - count;
-            // All observed control/settings frames leave enough room for a
-            // complete Waste header. Otherwise retain the short record.
-            if padding >= HEADER_SIZE {
-                write_waste(&mut self.w, padding).await?;
-                self.shaper.account(padding);
-                self.pending_padding += padding;
-            }
-            self.w.flush().await?;
-            self.finish_record();
-        }
-        if offset < buf.len() {
-            self.write_atomic(&buf[offset..]).await?;
-            self.w.flush().await?;
-            self.finish_record();
-        }
-        Ok(true)
-    }
-
-    /// Append the small v2 control suffix at a complete frame boundary.
-    /// The main switch disables it along with all other shaping. This suffix
-    /// remains after the substantial early padding has stopped.
+    /// Append bounded randomized Waste behind a complete control frame.
+    /// Never wait, flush separately or generate padding without real output.
     pub async fn append_control_padding(&mut self) -> io::Result<()> {
-        if self.shaper.is_enabled() && self.shaper.v2_policy {
-            // Flush a complete frame first if the suffix would exceed capacity.
-            if self.shaper.pending() + V2_CONTROL_PADDING > self.shaper.capacity {
-                self.ensure_record_boundary().await?;
-            }
-            self.pending_padding += V2_CONTROL_PADDING;
-            self.shaper.account(V2_CONTROL_PADDING);
-            write_waste(&mut self.w, V2_CONTROL_PADDING).await?;
+        let padding = self.shaper.control_padding(self.pending_padding);
+        if padding > 0 {
+            self.pending_padding += padding;
+            self.shaper.account(padding);
+            write_waste(&mut self.w, padding).await?;
         }
         Ok(())
     }
@@ -688,7 +672,123 @@ mod tests {
     const CAP: usize = 32 * 1024;
 
     #[tokio::test]
-    async fn reference_control_prefix_and_six_early_replies_preserve_frames() {
+    async fn reference_settings_do_not_force_three_prefix_records() {
+        for version in [1, 2] {
+            let (mut ws, log) = setup(true);
+            ws.shaper_mut().configure_reference_profile(true);
+            if version == 1 {
+                ws.shaper_mut().enable_reference_v1();
+            } else {
+                ws.shaper_mut().enable_v2();
+            }
+            let scheme = frame(Command::UpdatePaddingScheme, 0, 177);
+            ws.write_all(&scheme).await.unwrap();
+            ws.flush().await.unwrap();
+            assert_eq!(log.sizes().len(), 1, "settings must not force a prefix");
+            assert_eq!(log.stream(), scheme);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_padding_varies_without_extra_flushes() {
+        let started = Instant::now();
+        for reference in [false, true] {
+            let (mut ws, log) = v2_setup(CAP, true, false);
+            ws.shaper_mut().configure_reference_profile(reference);
+            for sid in 1..=16 {
+                ws.write_atomic(&frame(Command::HeartResponse, sid, 0))
+                    .await
+                    .unwrap();
+                ws.append_control_padding().await.unwrap();
+                ws.flush().await.unwrap();
+            }
+            let sizes = log.sizes();
+            assert_eq!(sizes.len(), 16, "padding must share the control flush");
+            assert!(sizes.iter().all(|n| (23..=71).contains(n)));
+            assert!(sizes.iter().any(|n| *n != sizes[0]), "fixed control length");
+            let frames = parse_frames(&log.stream());
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|(c, _)| *c == Command::HeartResponse)
+                    .count(),
+                16
+            );
+        }
+        assert_eq!(Instant::now(), started, "control padding must not wait");
+    }
+
+    #[tokio::test]
+    async fn control_padding_has_a_nonrenewable_session_budget() {
+        let (mut ws, log) = v2_setup(CAP, true, false);
+        for sid in 1..=1000 {
+            ws.shaper_mut().enable_v2();
+            ws.shaper_mut().start_burst_padding();
+            ws.write_atomic(&frame(Command::HeartResponse, sid, 0))
+                .await
+                .unwrap();
+            ws.append_control_padding().await.unwrap();
+            ws.flush().await.unwrap();
+            let stats = ws.shaper().counters().snapshot();
+            assert!(
+                stats.padded <= 1024 + stats.real_bytes() / 100,
+                "padding enlarged its own budget: {stats:?}"
+            );
+        }
+        let before = ws.shaper().counters().snapshot().padded;
+        ws.write_all(&frame(Command::Psh, 1001, 60_000))
+            .await
+            .unwrap();
+        ws.flush().await.unwrap();
+        for sid in 1002..=1020 {
+            ws.write_atomic(&frame(Command::SynAck, sid, 0))
+                .await
+                .unwrap();
+            ws.append_control_padding().await.unwrap();
+            ws.flush().await.unwrap();
+        }
+        let stats = ws.shaper().counters().snapshot();
+        assert!(
+            stats.padded > before,
+            "real data must earn limited padding credit"
+        );
+        assert!(stats.padded <= 1024 + stats.real_bytes() / 100);
+        assert_eq!(
+            parse_frames(&log.stream())
+                .iter()
+                .filter(|(c, _)| *c == Command::HeartResponse)
+                .count(),
+            1000
+        );
+    }
+
+    #[tokio::test]
+    async fn control_padding_never_sends_idle_records_or_overflows_small_buffers() {
+        for capacity in 1..=80 {
+            let (mut ws, log) = v2_setup(capacity, true, false);
+            ws.append_control_padding().await.unwrap();
+            ws.flush().await.unwrap();
+            assert!(
+                log.sizes().is_empty(),
+                "idle padding at capacity {capacity}"
+            );
+            ws.write_atomic(&frame(Command::HeartResponse, 1, 0))
+                .await
+                .unwrap();
+            ws.append_control_padding().await.unwrap();
+            ws.flush().await.unwrap();
+            assert_eq!(
+                log.sizes().len(),
+                1,
+                "extra control record at capacity {capacity}"
+            );
+            assert!(log.sizes()[0] <= capacity.max(7));
+            assert_eq!(parse_frames(&log.stream())[0], (Command::HeartResponse, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_six_early_replies_preserve_frames() {
         for version in [1, 2] {
             let (mut ws, log) = setup(true);
             ws.shaper_mut().configure_reference_profile(true);
@@ -701,12 +801,11 @@ mod tests {
             let initial = if version == 2 {
                 frame(Command::ServerSettings, 0, 10)
             } else {
-                let mut bytes = frame(Command::HeartResponse, 1, 0);
-                bytes.extend_from_slice(&frame(Command::Waste, 0, 3));
-                bytes
+                frame(Command::HeartResponse, 1, 0)
             };
-            assert!(ws.write_reference_prefix(&initial).await.unwrap());
-            assert_eq!(log.sizes(), [33, 13, 9]);
+            ws.write_atomic(&initial).await.unwrap();
+            ws.append_control_padding().await.unwrap();
+            ws.flush().await.unwrap();
             for id in 2..=8 {
                 ws.write_atomic(&frame(Command::HeartResponse, id, 0))
                     .await
@@ -715,8 +814,8 @@ mod tests {
                 ws.flush().await.unwrap();
             }
             let sizes = log.sizes();
-            assert!(sizes[3..9].iter().all(|n| (500..=1000).contains(n)));
-            assert_eq!(sizes[9], 17);
+            assert!(sizes[..6].iter().all(|n| (500..=1000).contains(n)));
+            assert!(sizes[6..].iter().all(|n| (23..=71).contains(n)));
             ws.shaper_mut().start_burst_padding();
             ws.shaper_mut().enable_v2();
             ws.write_atomic(&frame(Command::HeartResponse, 9, 0))
@@ -724,7 +823,7 @@ mod tests {
                 .unwrap();
             ws.append_control_padding().await.unwrap();
             ws.flush().await.unwrap();
-            assert_eq!(log.sizes()[10], 17);
+            assert!((23..=71).contains(&log.sizes()[8]));
             let frames = parse_frames(&log.stream());
             assert_eq!(
                 frames
@@ -734,21 +833,6 @@ mod tests {
                 if version == 1 { 9 } else { 8 }
             );
         }
-    }
-
-    #[tokio::test]
-    async fn reference_scheme_split_has_no_padding_inside_frame() {
-        let (mut ws, log) = setup(true);
-        ws.shaper_mut().configure_reference_profile(true);
-        ws.shaper_mut().enable_v2();
-        let scheme = frame(Command::UpdatePaddingScheme, 0, 177);
-        assert!(ws.write_reference_prefix(&scheme).await.unwrap());
-        assert_eq!(log.sizes(), [33, 13, 9, 129]);
-        assert_eq!(log.stream(), scheme);
-        assert_eq!(
-            parse_frames(&log.stream()),
-            [(Command::UpdatePaddingScheme, 177)]
-        );
     }
 
     /// A writer that records the plaintext size of every `poll_write` call.
@@ -879,7 +963,7 @@ mod tests {
         }
         assert!(log.sizes().iter().all(|n| (500..=1000).contains(n)));
         let early_cost = ws.shaper.counters().snapshot().padded;
-        assert!(early_cost <= 8192 + 80);
+        assert!(early_cost <= 8192 + 8 * 64);
         for _ in 0..100 {
             ws.shaper.enable_v2();
             ws.shaper.mark_burst_head();
@@ -890,8 +974,13 @@ mod tests {
             ws.append_control_padding().await.unwrap();
             ws.flush().await.unwrap();
         }
-        assert!(log.sizes()[8..].iter().all(|n| *n == 17));
-        assert_eq!(ws.shaper.counters().snapshot().padded - early_cost, 1000);
+        assert!(log.sizes()[8..].iter().all(|n| (7..=71).contains(n)));
+        assert!(
+            log.sizes()[8..].contains(&7),
+            "control allowance must run out"
+        );
+        let stats = ws.shaper.counters().snapshot();
+        assert!(stats.padded <= 8192 + 1024 + stats.real_bytes() / 100);
         assert_eq!(
             parse_frames(&log.stream())
                 .iter()
@@ -929,17 +1018,24 @@ mod tests {
         ws.write_fin(&frame(Command::Fin, 3, 0)).await.unwrap();
         ws.flush().await.unwrap();
         let sizes = log.sizes();
-        assert_eq!(&sizes[before..], &[32768, 27239, 17]);
-        assert_eq!(ws.shaper.counters().snapshot().padded - overhead, 10);
+        assert_eq!(&sizes[before..before + 2], &[32768, 27239]);
+        assert!((23..=71).contains(&sizes[before + 2]));
+        assert_eq!(
+            ws.shaper.counters().snapshot().padded - overhead,
+            (sizes[before + 2] - 7) as u64
+        );
         let frames = parse_frames(&log.stream());
         assert_eq!(
-            &frames[frames.len() - 3..],
-            &[
-                (Command::Psh, 60_000),
-                (Command::Fin, 0),
-                (Command::Waste, 3)
-            ]
+            frames
+                .iter()
+                .filter(|(c, _)| *c != Command::Waste)
+                .copied()
+                .collect::<Vec<_>>()
+                .last_chunk::<2>()
+                .unwrap(),
+            &[(Command::Psh, 60_000), (Command::Fin, 0)]
         );
+        assert_eq!(frames.last().unwrap().0, Command::Waste);
     }
 
     #[tokio::test]
@@ -957,19 +1053,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_v2_switches_and_small_buffers_preserve_valid_frames() {
-        for (main, early, expected) in [(false, true, 7), (true, false, 17), (true, true, 64)] {
+        for (main, early) in [(false, true), (true, false), (true, true)] {
             let (mut ws, log) = v2_setup(64, main, early);
             ws.write_atomic(&frame(Command::HeartResponse, 0, 0))
                 .await
                 .unwrap();
             ws.append_control_padding().await.unwrap();
             ws.flush().await.unwrap();
-            assert_eq!(log.sizes(), vec![expected]);
+            assert_eq!(log.sizes().len(), 1);
+            let size = log.sizes()[0];
+            if !main {
+                assert_eq!(size, 7);
+            } else if early {
+                assert_eq!(size, 64);
+            } else {
+                assert!((23..=64).contains(&size));
+            }
             let frames = parse_frames(&log.stream());
             assert_eq!(frames[0], (Command::HeartResponse, 0));
             assert_eq!(
                 ws.shaper.counters().snapshot().padded,
-                if main { (expected - 7) as u64 } else { 0 }
+                if main { (size - 7) as u64 } else { 0 }
             );
         }
     }
