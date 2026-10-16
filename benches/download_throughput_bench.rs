@@ -73,8 +73,15 @@ fn bench_download_throughput(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(TOTAL_BYTES as u64));
     group.sample_size(10);
 
-    for &buf_size in &[32768_usize, 65536, 262144] {
-        group.bench_function(format!("buf_{}k", buf_size / 1024), |b| {
+    for (mode, stream_padding, buf_size) in [
+        ("legacy", false, 32768_usize),
+        ("stream", true, 32768),
+        ("legacy", false, 65536),
+        ("stream", true, 65536),
+        ("legacy", false, 262144),
+        ("stream", true, 262144),
+    ] {
+        group.bench_function(format!("{mode}/buf_{}k", buf_size / 1024), |b| {
             let server_cfg = server_tls_config.clone();
             let client_cfg = client_tls_config.clone();
             let md5 = padding_md5.clone();
@@ -98,7 +105,10 @@ fn bench_download_throughput(c: &mut Criterion) {
                         let session = Arc::new(Session::new_server(
                             tls_stream,
                             padding,
-                            SessionConfig::default(),
+                            SessionConfig {
+                                downlink_stream_padding: stream_padding,
+                                ..SessionConfig::default()
+                            },
                         ));
 
                         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
@@ -111,6 +121,7 @@ fn bench_download_throughput(c: &mut Criterion) {
                             );
 
                         let stream = new_stream_rx.recv().await.unwrap();
+                        session.handshake_success(stream.id()).await.unwrap();
 
                         // Remote data source
                         let (remote, mut remote_source) = tokio::io::duplex(4 * 1024 * 1024);
@@ -178,7 +189,7 @@ fn bench_download_throughput(c: &mut Criterion) {
                                     assert!(payload[..n].iter().all(|&b| b == 0xAB));
                                     received += n;
                                 }
-                                Command::Waste | Command::ServerSettings => {}
+                                Command::Waste | Command::ServerSettings | Command::SynAck => {}
                                 command => panic!("unexpected frame {command:?}"),
                             }
                         }
@@ -192,7 +203,6 @@ fn bench_download_throughput(c: &mut Criterion) {
             });
         });
     }
-
     group.finish();
 }
 

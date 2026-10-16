@@ -131,6 +131,7 @@ async fn main() -> Result<()> {
         .write_buf_size(cli.write_buf_size)
         .downlink_padding(cli.downlink_padding)
         .downlink_burst_padding(cli.downlink_burst_padding)
+        .downlink_stream_padding(cli.downlink_stream_padding)
         .auth_probe_resistance(cli.auth_probe_resistance)
         .stream_channel_capacity(cli.stream_channel_capacity);
 

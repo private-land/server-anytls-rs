@@ -164,6 +164,12 @@ pub struct CliArgs {
     )]
     pub downlink_burst_padding: bool,
 
+    /// Experimental per-stream early shaping with a shared 2% payload budget
+    /// plus 2 KiB startup credit. Requires both downlink padding switches.
+    #[arg(long, env = "X_PANDA_ANYTLS_DOWNLINK_STREAM_PADDING", default_value_t = false,
+        help_heading = "Performance", action = clap::ArgAction::Set)]
+    pub downlink_stream_padding: bool,
+
     /// Reference TLS rejection, five-second deadlines and v1/v2 downlink
     /// record policies. Set false to retain legacy behavior.
     #[arg(
@@ -274,6 +280,7 @@ mod tests {
             write_buf_size: 32 * 1024,
             downlink_padding: true,
             downlink_burst_padding: true,
+            downlink_stream_padding: false,
             auth_probe_resistance: true,
             stream_channel_capacity: 128,
         }
@@ -468,6 +475,26 @@ mod tests {
                 let cli = CliArgs::try_parse_from(["anytls", "--node", "1", &argument]).unwrap();
                 assert_eq!(cli.auth_probe_resistance, enabled);
             }
+        }
+    }
+
+    #[test]
+    fn stream_padding_cli_accepts_explicit_opt_in_and_off() {
+        assert!(
+            !CliArgs::try_parse_from(["anytls", "--node", "1"])
+                .unwrap()
+                .downlink_stream_padding
+        );
+        for value in ["true", "false"] {
+            let result = CliArgs::try_parse_from([
+                "anytls",
+                "--node",
+                "1",
+                "--downlink_stream_padding",
+                value,
+            ]);
+            assert!(result.is_ok(), "stream padding option rejected: {result:?}");
+            assert_eq!(result.unwrap().downlink_stream_padding, value == "true");
         }
     }
 

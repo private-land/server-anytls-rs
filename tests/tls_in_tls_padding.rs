@@ -92,6 +92,7 @@ async fn https_probe(
         enabled,
         exhaust_window,
         false,
+        false,
     )
     .await
 }
@@ -103,6 +104,7 @@ async fn https_probe_profile(
     enabled: bool,
     exhaust_window: bool,
     reference_profile: bool,
+    stream_padding: bool,
 ) -> Vec<usize> {
     let (backend_tls, backend_client_tls) = tls_configs();
     let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -139,6 +141,7 @@ async fn https_probe_profile(
         .router(Arc::new(DirectRouter))
         .tls_config(server_tls)
         .auth_probe_resistance(reference_profile)
+        .downlink_stream_padding(stream_padding)
         .downlink_padding(enabled);
     if let Some(enabled) = burst_padding {
         builder = builder.downlink_burst_padding(enabled);
@@ -243,7 +246,7 @@ async fn https_probe_profile(
         }
     }
     if exhaust_window {
-        assert!(version == 2 || reference_profile);
+        assert!(version == 2 || reference_profile || stream_padding);
         for _ in 0..8 {
             outer
                 .write_all(&frame(Command::HeartRequest, 0, &[]))
@@ -323,7 +326,9 @@ async fn reference_profile_preserves_verified_https_for_v1_v2_and_switches() {
                 for exhausted in [true, false] {
                     let lengths = tokio::time::timeout(
                         Duration::from_secs(10),
-                        https_probe_profile(None, version, matched, enabled, exhausted, true),
+                        https_probe_profile(
+                            None, version, matched, enabled, exhausted, true, false,
+                        ),
                     )
                     .await
                     .unwrap();
@@ -335,6 +340,37 @@ async fn reference_profile_preserves_verified_https_for_v1_v2_and_switches() {
                             "fixed reference prefix remains on the TLS wire"
                         );
                     }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn stream_padding_preserves_nested_https_after_session_start_for_v1_v2() {
+    for version in [1, 2] {
+        for reference in [false, true] {
+            for (main, burst) in [(true, true), (false, true), (true, false)] {
+                let lengths = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    https_probe_profile(Some(burst), version, true, main, true, reference, true),
+                )
+                .await
+                .unwrap();
+                println!(
+                    "stream policy v{version} reference={reference} main={main} burst={burst}: {lengths:?}"
+                );
+                assert!(lengths.len() >= 2);
+                if main && burst {
+                    assert!(
+                        lengths.iter().all(|&n| n >= 337),
+                        "late short HTTPS response exposed: {lengths:?}"
+                    );
+                } else {
+                    assert!(
+                        lengths.iter().any(|&n| n < 160),
+                        "disabled policy still shapes short response: {lengths:?}"
+                    );
                 }
             }
         }

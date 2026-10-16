@@ -20,6 +20,8 @@ struct Args {
     password: String,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     reference_profile: bool,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    stream_padding: bool,
 }
 
 #[tokio::main]
@@ -40,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         Server::builder()
             .authenticator(Arc::new(SinglePasswordAuth::new(&args.password)))
             .auth_probe_resistance(args.reference_profile)
+            .downlink_stream_padding(args.stream_padding)
             .tls_config(tls)
             .build()?,
     );

@@ -1,5 +1,10 @@
 //! Server-side downlink padding using protocol-compatible Waste frames.
 //!
+//! The opt-in stream policy replaces the profiles below with bounded early
+//! windows selected by stream ID. Data and control padding share startup
+//! credit plus 2% of PSH payload; normal batching resumes outside the windows.
+//! It adds counter entries, never payload buffers, timers or idle writes.
+//!
 //! The reference profile uses six substantial flush attempts for v1/v2,
 //! without a fixed plaintext prefix. It preserves complete frame streams
 //! across record splits and never replenishes its session window.
@@ -31,6 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use rustc_hash::FxHashMap;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::time::Instant;
 
@@ -78,6 +84,57 @@ const CONTROL_PADDING_BOOTSTRAP: u64 = 1024;
 /// A `Waste` frame is `HEADER_SIZE` bytes of header plus a payload; the
 /// smallest useful one is a bare header.
 const MIN_WASTE_FRAME: usize = HEADER_SIZE;
+
+/// Credit is earned only by successfully written PSH payload. All padding,
+/// including control suffixes, spends this shared allowance before I/O.
+struct StreamPadding {
+    windows: FxHashMap<u32, StreamWindow>,
+    limit: usize,
+    payload: u64,
+    spent: u64,
+    active: Option<u32>,
+}
+
+struct StreamWindow {
+    bytes: usize,
+    records: usize,
+    padding: usize,
+}
+
+impl StreamPadding {
+    fn remaining(&self) -> usize {
+        (2048 + self.payload / 50)
+            .saturating_sub(self.spent)
+            .min(2048) as usize
+    }
+
+    fn active(&self) -> bool {
+        self.remaining() >= MIN_WASTE_FRAME
+            && self
+                .active
+                .and_then(|id| self.windows.get(&id))
+                .is_some_and(|w| w.records > 0 && w.padding >= MIN_WASTE_FRAME)
+    }
+
+    fn reserve(&mut self, wanted: usize, control: bool) -> usize {
+        let mut available = self.remaining();
+        if !control {
+            if !self.active() {
+                return 0;
+            }
+            available = available.min(self.windows[&self.active.unwrap()].padding);
+        }
+        let pad = wanted.min(available);
+        if pad < MIN_WASTE_FRAME {
+            return 0;
+        }
+        self.spent = self.spent.saturating_add(pad as u64);
+        if !control {
+            self.windows.get_mut(&self.active.unwrap()).unwrap().padding -= pad;
+        }
+        pad
+    }
+}
 
 /// Process-wide seed source, so two sessions never draw the same sequence.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -160,6 +217,7 @@ pub struct DownlinkShaper {
     capacity: usize,
     reference_profile: bool,
     control_padding_spent: u64,
+    stream_padding: Option<StreamPadding>,
 }
 
 impl DownlinkShaper {
@@ -199,6 +257,7 @@ impl DownlinkShaper {
             capacity: buf_capacity.max(1),
             reference_profile: false,
             control_padding_spent: 0,
+            stream_padding: None,
         };
         shaper.pick_target();
         shaper
@@ -211,6 +270,68 @@ impl DownlinkShaper {
     /// never overridden by a peer's announcement.
     pub fn enable(&mut self) {
         self.enabled = self.configured;
+        if self.stream_padding.is_some() {
+            self.pick_target();
+        }
+    }
+
+    pub fn configure_stream_padding(&mut self, enabled: bool, max_streams: usize) {
+        if enabled {
+            self.stream_padding = Some(StreamPadding {
+                windows: FxHashMap::default(),
+                limit: max_streams,
+                payload: 0,
+                spent: 0,
+                active: None,
+            });
+        }
+    }
+
+    pub fn open_stream(&mut self, id: u32) {
+        if self.enabled
+            && self.burst_configured
+            && let Some(policy) = &mut self.stream_padding
+            && policy.windows.len() < policy.limit
+        {
+            policy.windows.entry(id).or_insert(StreamWindow {
+                bytes: 4096,
+                records: 4,
+                padding: 1024,
+            });
+        }
+    }
+
+    pub fn close_stream(&mut self, id: u32) {
+        if let Some(policy) = &mut self.stream_padding {
+            policy.windows.remove(&id);
+        }
+    }
+
+    fn select_stream(&mut self, id: u32) -> bool {
+        if let Some(policy) = &mut self.stream_padding {
+            policy.active = Some(id);
+            self.pick_target();
+        }
+        self.enabled
+            && self.burst_configured
+            && self
+                .stream_padding
+                .as_ref()
+                .is_some_and(StreamPadding::active)
+    }
+
+    fn finish_data(&mut self, id: u32, payload_len: usize) {
+        if let Some(policy) = &mut self.stream_padding {
+            policy.payload = policy.payload.saturating_add(payload_len as u64);
+            if let Some(window) = policy.windows.get_mut(&id) {
+                window.bytes = window.bytes.saturating_sub(payload_len);
+                if window.bytes == 0 || window.records == 0 || window.padding < MIN_WASTE_FRAME {
+                    policy.windows.remove(&id);
+                }
+            }
+            policy.active = None;
+            self.pick_target();
+        }
     }
 
     pub fn configure_reference_profile(&mut self, enabled: bool) {
@@ -267,6 +388,9 @@ impl DownlinkShaper {
     /// Re-arm the legacy v1 early window after outbound success. v2 ignores
     /// this call: its session window can never be replenished.
     pub fn start_burst_padding(&mut self) {
+        if self.stream_padding.is_some() {
+            return;
+        }
         if !self.v2_policy && self.enabled && self.burst_configured {
             self.burst_deadline = Some(Instant::now() + BURST_DURATION);
             self.burst_budget = BURST_PADDING_BUDGET;
@@ -317,7 +441,8 @@ impl DownlinkShaper {
     /// The returned count includes the `Waste` frame header. Padding is only
     /// ever appended behind *complete* frames.
     pub fn tail_padding(&self) -> usize {
-        if self.v2_policy
+        if self.stream_padding.is_some()
+            || self.v2_policy
             || !self.enabled
             || !self.head
             || self.pending == 0
@@ -338,6 +463,14 @@ impl DownlinkShaper {
     /// floor; larger tails get random additional bytes, changing burst totals
     /// as well as record boundaries. Mid-frame split flushes never use this.
     fn padding_for_flush(&mut self) -> usize {
+        if self.stream_padding.is_some() {
+            if !self.enabled || !self.burst_configured || self.pending == 0 {
+                return 0;
+            }
+            let target = self.range(320.min(self.capacity), 768.min(self.capacity));
+            let wanted = target.saturating_sub(self.pending);
+            return self.stream_padding.as_mut().unwrap().reserve(wanted, false);
+        }
         if self.v2_policy {
             if !self.v2_early_active() || self.pending == 0 {
                 return 0;
@@ -374,6 +507,11 @@ impl DownlinkShaper {
 
     fn reserve_record_flush(&mut self) {
         if self.pending > 0 {
+            if let Some(policy) = &mut self.stream_padding
+                && let Some(window) = policy.active.and_then(|id| policy.windows.get_mut(&id))
+            {
+                window.records = window.records.saturating_sub(1);
+            }
             self.v2_records = self.v2_records.saturating_sub(1);
             // Count attempts conservatively: bytes may have reached the peer
             // even if the underlying flush subsequently fails or is cancelled.
@@ -382,6 +520,14 @@ impl DownlinkShaper {
     }
 
     fn control_padding(&mut self, pending_padding: usize) -> usize {
+        if self.stream_padding.is_some() {
+            if !self.enabled || !self.burst_configured || self.pending == 0 {
+                return 0;
+            }
+            let available = self.capacity.saturating_sub(self.pending);
+            let wanted = self.range(16, 64).min(available);
+            return self.stream_padding.as_mut().unwrap().reserve(wanted, true);
+        }
         if !self.enabled || !self.v2_policy || self.pending == 0 {
             return 0;
         }
@@ -411,7 +557,7 @@ impl DownlinkShaper {
     /// Mark the next record as a burst head: the session start, or the head of
     /// a proxied connection's downlink (`SynAck` for v2, first data for v1).
     pub fn mark_burst_head(&mut self) {
-        if !self.enabled || self.v2_policy {
+        if !self.enabled || self.v2_policy || self.stream_padding.is_some() {
             return;
         }
         self.head = true;
@@ -441,6 +587,15 @@ impl DownlinkShaper {
     }
 
     fn pick_target(&mut self) {
+        if let Some(policy) = &self.stream_padding {
+            let (lo, hi) = if self.burst_configured && policy.active() {
+                clamp_band(SPLIT_MIN, SPLIT_MAX, self.capacity)
+            } else {
+                (self.capacity, self.capacity)
+            };
+            self.target = self.range(lo, hi);
+            return;
+        }
         if self.v2_policy {
             let (lo, hi) = if self.v2_early_active() {
                 clamp_band(500, 1000, self.capacity)
@@ -527,6 +682,44 @@ impl<W: AsyncWrite + Unpin> WriteState<W> {
 
     pub fn shaper_mut(&mut self) -> &mut DownlinkShaper {
         &mut self.shaper
+    }
+
+    /// Select early shaping by stream ID, keeping padding behind complete PSH
+    /// frames. Bulk frames retain normal batching after the finite window.
+    pub async fn write_data_frame(
+        &mut self,
+        id: u32,
+        frame: &[u8],
+        payload_len: usize,
+    ) -> io::Result<()> {
+        let candidate = self.shaper.enabled
+            && self.shaper.burst_configured
+            && self.shaper.stream_padding.as_ref().is_some_and(|p| {
+                p.remaining() >= MIN_WASTE_FRAME
+                    && p.windows.get(&id).is_some_and(|w| {
+                        w.bytes > 0 && w.records > 0 && w.padding >= MIN_WASTE_FRAME
+                    })
+            });
+        let early = if candidate {
+            self.ensure_record_boundary().await?;
+            self.shaper.select_stream(id)
+        } else {
+            false
+        };
+        self.write_all(frame).await?;
+        // A large frame may already have exhausted the window in write_all.
+        // Its ordinary tail must remain available for the next writer batch.
+        if early
+            && self
+                .shaper
+                .stream_padding
+                .as_ref()
+                .is_some_and(StreamPadding::active)
+        {
+            self.flush().await?;
+        }
+        self.shaper.finish_data(id, payload_len);
+        Ok(())
     }
 
     /// Write framed bytes, ending the current TLS record whenever it reaches the
@@ -670,6 +863,180 @@ mod tests {
 
     /// Test capacity, matching the production default.
     const CAP: usize = 32 * 1024;
+
+    fn stream_setup(capacity: usize) -> (WriteState<Recorder>, Log) {
+        let (mut ws, log) = v2_setup(capacity, true, true);
+        ws.shaper_mut().configure_stream_padding(true, 256);
+        ws.shaper_mut().enable();
+        (ws, log)
+    }
+
+    #[tokio::test]
+    async fn stream_padding_large_first_frame_keeps_tail_buffered_after_four_splits() {
+        let (mut ws, log) = stream_setup(CAP);
+        ws.shaper_mut().open_stream(1);
+        ws.write_data_frame(1, &frame(Command::Psh, 1, 12_000), 12_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            log.sizes().len(),
+            4,
+            "exhausted early window must not eagerly flush the bulk tail"
+        );
+        assert!(log.stream().len() < 12_007, "bulk tail was not buffered");
+        ws.write_data_frame(1, &frame(Command::Psh, 1, 1000), 1000)
+            .await
+            .unwrap();
+        assert_eq!(
+            log.sizes().len(),
+            4,
+            "following bulk frame must share the buffered tail"
+        );
+        ws.flush().await.unwrap();
+        assert_eq!(log.sizes().len(), 5);
+        assert_eq!(
+            parse_frames(&log.stream()),
+            vec![(Command::Psh, 12_000), (Command::Psh, 1000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_padding_bulk_restores_buffered_writes() {
+        let (mut ws, log) = stream_setup(CAP);
+        ws.shaper_mut().open_stream(1);
+        let small = frame(Command::Psh, 1, 40);
+        for _ in 0..4 {
+            ws.write_data_frame(1, &small, 40).await.unwrap();
+        }
+        ws.flush().await.unwrap();
+        let before = log.sizes().len();
+        // Exhausting a stream window must not flush each queued data frame.
+        let bulk = frame(Command::Psh, 1, 1000);
+        for _ in 0..128 {
+            ws.write_data_frame(1, &bulk, 1000).await.unwrap();
+        }
+        ws.flush().await.unwrap();
+        assert!(
+            log.sizes().len() - before <= 5,
+            "bulk batching lost: {} writes",
+            log.sizes().len() - before
+        );
+        assert_eq!(
+            parse_frames(&log.stream())
+                .iter()
+                .filter(|(c, _)| *c == Command::Psh)
+                .count(),
+            132
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_padding_shares_credit_across_control_and_reused_streams() {
+        let (mut ws, log) = stream_setup(CAP);
+        for id in 1..=1000 {
+            // Neither new streams nor repeated Settings may reset credit.
+            ws.shaper_mut().enable_v2();
+            ws.shaper_mut().open_stream(id);
+            ws.write_atomic(&frame(Command::SynAck, id, 0))
+                .await
+                .unwrap();
+            ws.append_control_padding().await.unwrap();
+            ws.flush().await.unwrap();
+            ws.write_data_frame(id, &frame(Command::Psh, id, 20), 20)
+                .await
+                .unwrap();
+            ws.flush().await.unwrap();
+            ws.shaper_mut().close_stream(id);
+            let stats = ws.shaper().counters().snapshot();
+            assert!(
+                stats.padded <= 2048 + (id as u64 * 20) / 50,
+                "credit minted by framing or padding: {stats:?}"
+            );
+        }
+        assert_eq!(
+            parse_frames(&log.stream())
+                .iter()
+                .filter(|(c, _)| *c == Command::Psh)
+                .count(),
+            1000
+        );
+        assert!(
+            ws.shaper()
+                .stream_padding
+                .as_ref()
+                .unwrap()
+                .windows
+                .is_empty()
+        );
+        // With no useful payload, control-only traffic must stop spending.
+        for _ in 0..100 {
+            ws.write_atomic(&frame(Command::HeartResponse, 0, 0))
+                .await
+                .unwrap();
+            ws.append_control_padding().await.unwrap();
+            ws.flush().await.unwrap();
+        }
+        let before = ws.shaper().counters().snapshot().padded;
+        // A completed bulk payload earns fresh credit for a later stream.
+        ws.write_data_frame(1001, &frame(Command::Psh, 1001, 60_000), 60_000)
+            .await
+            .unwrap();
+        ws.flush().await.unwrap();
+        ws.shaper_mut().open_stream(1002);
+        ws.write_data_frame(1002, &frame(Command::Psh, 1002, 20), 20)
+            .await
+            .unwrap();
+        ws.flush().await.unwrap();
+        assert!(ws.shaper().counters().snapshot().padded > before);
+    }
+
+    #[tokio::test]
+    async fn stream_padding_early_record_count_is_bounded_for_large_first_write() {
+        let (mut ws, log) = stream_setup(CAP);
+        ws.shaper_mut().open_stream(1);
+        ws.write_data_frame(1, &frame(Command::Psh, 1, 60_000), 60_000)
+            .await
+            .unwrap();
+        ws.flush().await.unwrap();
+        assert!(
+            log.sizes().len() <= 7,
+            "large write split for its entire length: {:?}",
+            log.sizes()
+        );
+        assert_eq!(
+            parse_frames(&log.stream())
+                .iter()
+                .filter(|(c, _)| *c == Command::Psh)
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(Command::Psh, 60_000)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_padding_small_buffers_and_switches_preserve_bytes_without_waiting() {
+        let started = Instant::now();
+        for capacity in [1, 7, 8, 64, 512, CAP] {
+            for (main, burst) in [(false, true), (true, false), (true, true)] {
+                let (mut ws, log) = v2_setup(capacity, main, burst);
+                ws.shaper_mut().configure_stream_padding(true, 2);
+                ws.shaper_mut().enable();
+                ws.shaper_mut().open_stream(1);
+                ws.shaper_mut().open_stream(2);
+                ws.shaper_mut().open_stream(3);
+                assert!(ws.shaper().stream_padding.as_ref().unwrap().windows.len() <= 2);
+                let data = frame(Command::Psh, 1, 200);
+                ws.write_data_frame(1, &data, 200).await.unwrap();
+                ws.flush().await.unwrap();
+                let frames = parse_frames(&log.stream());
+                assert_eq!(frames[0], (Command::Psh, 200));
+                if !main || !burst {
+                    assert_eq!(log.stream(), data);
+                }
+            }
+        }
+        assert_eq!(Instant::now(), started);
+    }
 
     #[tokio::test]
     async fn reference_settings_do_not_force_three_prefix_records() {
@@ -1134,7 +1501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v2_failed_or_cancelled_flushes_cannot_reuse_early_budget() {
+    async fn test_failed_or_cancelled_flushes_cannot_reuse_early_budget() {
         struct FailFlush(Recorder, bool);
         impl AsyncWrite for FailFlush {
             fn poll_write(
@@ -1155,12 +1522,17 @@ mod tests {
                 Poll::Ready(Ok(()))
             }
         }
-        for stall in [false, true] {
+        for (stall, stream_policy) in [(false, false), (true, false), (false, true), (true, true)] {
             let log = Log::default();
             let mut ws =
                 WriteState::new(FailFlush(Recorder { log: log.clone() }, stall), CAP, true);
             ws.shaper.configure_burst_padding(true);
+            ws.shaper.configure_stream_padding(stream_policy, 256);
             ws.shaper.enable_v2();
+            if stream_policy {
+                ws.shaper.open_stream(1);
+                ws.shaper.select_stream(1);
+            }
             ws.write_atomic(&frame(Command::HeartResponse, 0, 0))
                 .await
                 .unwrap();
@@ -1177,8 +1549,21 @@ mod tests {
                 }
             }
             assert!(log.stream().len() <= 1000);
-            assert_eq!(ws.shaper.v2_records, 0);
-            assert!(ws.shaper.v2_budget < 8192);
+            if stream_policy {
+                let policy = ws.shaper.stream_padding.as_ref().unwrap();
+                assert_eq!(policy.payload, 0, "control bytes must not earn credit");
+                let actual_padding: usize = parse_frames(&log.stream())
+                    .into_iter()
+                    .filter(|(c, _)| *c == Command::Waste)
+                    .map(|(_, n)| n + HEADER_SIZE)
+                    .sum();
+                assert_eq!(actual_padding as u64, policy.spent);
+                assert!(policy.spent <= 2048);
+                assert_eq!(policy.windows[&1].records, 0);
+            } else {
+                assert_eq!(ws.shaper.v2_records, 0);
+                assert!(ws.shaper.v2_budget < 8192);
+            }
             parse_frames(&log.stream());
         }
     }

@@ -44,7 +44,8 @@ async fn write_psh_frames<W: AsyncWrite + Unpin>(
         header.encode(&mut hdr_buf);
         combined_buf.extend_from_slice(&hdr_buf);
         combined_buf.extend_from_slice(chunk);
-        w.write_all(combined_buf).await?;
+        w.write_data_frame(cmd.stream_id, combined_buf, chunk.len())
+            .await?;
         offset = chunk_end;
         if offset >= total {
             break;
@@ -73,6 +74,7 @@ async fn write_cmd_frame<W: AsyncWrite + Unpin>(
         let mut hdr_buf = [0u8; HEADER_SIZE];
         header.encode(&mut hdr_buf);
         w.write_fin(&hdr_buf).await?;
+        w.shaper_mut().close_stream(cmd.stream_id);
     }
     Ok(())
 }
@@ -124,6 +126,8 @@ pub struct SessionConfig {
     pub downlink_padding: bool,
     /// Bounded padding after outbound success; enabled by default for v1/v2.
     pub downlink_burst_padding: bool,
+    /// Opt-in per-stream policy; leaves the existing profile intact when off.
+    pub downlink_stream_padding: bool,
 }
 
 impl Default for SessionConfig {
@@ -136,6 +140,7 @@ impl Default for SessionConfig {
             stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
             downlink_padding: true,
             downlink_burst_padding: true,
+            downlink_stream_padding: false,
         }
     }
 }
@@ -164,6 +169,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         write_state
             .shaper_mut()
             .configure_burst_padding(config.downlink_burst_padding);
+        write_state
+            .shaper_mut()
+            .configure_stream_padding(config.downlink_stream_padding, config.max_streams);
         // Clone the shaper's counters out of the write state so the session
         // can report them at close without taking the write lock.
         let shaping_counters = write_state.shaper().counters().clone();
@@ -507,6 +515,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             // the head band instead of emitting a bare 28-byte record. No-op
             // for the legacy policy; v2 never re-arms its session window.
             if command == Command::SynAck {
+                if data.is_empty() {
+                    w.shaper_mut().open_stream(stream_id);
+                }
                 w.shaper_mut().mark_burst_head();
             }
             // Use stack buffer for small control frames (FIN, SynAck, HeartResponse, etc.)
@@ -625,6 +636,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 .await
                 .map_err(|_| crate::error::Error::WriteTimeout)?;
             w.shaper_mut().mark_burst_head();
+            w.shaper_mut().open_stream(stream_id);
             w.shaper_mut().start_burst_padding();
         }
         Ok(())
@@ -703,6 +715,72 @@ mod tests {
         w.write_all(&hdr_buf).await.unwrap();
         if !data.is_empty() {
             w.write_all(data).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_padding_covers_late_stream_data_for_v1_and_v2() {
+        for version in [1, 2] {
+            let (mut client, server) = duplex(65536);
+            let session = Session::new_server(
+                server,
+                test_padding(),
+                SessionConfig {
+                    downlink_stream_padding: true,
+                    ..SessionConfig::default()
+                },
+            );
+            session.peer_version.store(version, Ordering::Relaxed);
+            {
+                let mut w = session.write_half.lock().await;
+                w.shaper_mut().enable_v2();
+            }
+            let mut wire = vec![0; 65536];
+            // Exhaust the old outer-session window before the next stream.
+            for _ in 0..10 {
+                session
+                    .write_frame(Command::HeartResponse, 0, &[])
+                    .await
+                    .unwrap();
+                assert!(client.read(&mut wire).await.unwrap() > 0);
+            }
+            session.handshake_success(3).await.unwrap();
+            if version == 2 {
+                assert!(client.read(&mut wire).await.unwrap() > 0);
+            }
+            let before = session.shaping_stats().padded;
+            let cmd = WriteCommand {
+                stream_id: 3,
+                data: Bytes::from_static(b"HTTP/1.1 204 No Content\r\n\r\n"),
+                fin: false,
+            };
+            let mut w = session.write_half.lock().await;
+            write_cmd_frame(&mut *w, &cmd, &mut Vec::new())
+                .await
+                .unwrap();
+            w.flush().await.unwrap();
+            drop(w);
+            let n = client.read(&mut wire).await.unwrap();
+            assert!(
+                n >= 320,
+                "v{version}: late short response is still bare ({n} bytes)"
+            );
+            assert!(session.shaping_stats().padded > before);
+            let mut offset = 0;
+            let mut payload = Vec::new();
+            while offset < n {
+                let header =
+                    FrameHeader::decode(wire[offset..offset + HEADER_SIZE].try_into().unwrap());
+                offset += HEADER_SIZE;
+                let end = offset + header.length as usize;
+                match header.command {
+                    Command::Psh => payload.extend_from_slice(&wire[offset..end]),
+                    Command::Waste => {}
+                    other => panic!("unexpected frame {other:?}"),
+                }
+                offset = end;
+            }
+            assert_eq!(payload, cmd.data);
         }
     }
 

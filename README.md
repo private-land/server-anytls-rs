@@ -58,6 +58,7 @@ All arguments support environment variables with `X_PANDA_ANYTLS_` prefix.
 | `--stream_channel_capacity` | `128` | Per-stream data channel capacity (number of buffered messages). |
 | `--downlink_padding` | `true` | Server-side downlink shaping for protocol v1/v2. v2 uses a bounded session-level early window, then normal bulk buffering; control Waste is randomized and capped by a separate session budget. Legacy v1 retains split/head-fill shaping. Set `false` for an unshaped control. |
 | `--downlink_burst_padding` | `true` | Reference v1/v2: the first 6 non-empty flush attempts, capped at 8 KiB per session. Legacy v2: 8 attempts / 8 KiB per session. Legacy v1: at most 3 seconds / 8 records / 2 KiB after outbound success. Requires `--downlink_padding true`. Set `false` to disable substantial early fill while retaining bounded control padding or legacy v1 split/head-fill. |
+| `--downlink_stream_padding` | `false` | Experimental per-stream early shaping for v1/v2. Replaces the existing downlink record policy when enabled; see the shared budget below. |
 | `--auth_probe_resistance` | `true` | Reference TLS rejection, handshake record organization, v1/v2 downlink shaping and separate five-second TLS/authentication deadlines. Set `false` to retain the original behavior. Certificates are unchanged. |
 | `--refresh_geodata` | `false` | Force refresh ACL geodata |
 
@@ -118,6 +119,32 @@ a known copy of its internal algorithm. Plaintext flushes are not necessarily in
 TLS records. In legacy mode, v1 retains its existing per-stream early window and continuous
 split/head-fill policy. These policies do not deliberately delay writes or
 remove directional/timing correlations, and do not establish censorship resistance.
+
+Opt in to the experimental stream policy with `--downlink_stream_padding true`
+or `X_PANDA_ANYTLS_DOWNLINK_STREAM_PADDING=true`. Existing clients need no new
+commands or padding scheme. Both downlink switches must be enabled for its
+early shaping. The reference TLS/authentication profile remains independent.
+
+Each successfully opened stream gets at most four early plaintext flush attempts
+and 1 KiB of data padding. Only the first 4 KiB of payload is eligible to start
+an early frame; a large first frame consumes at most four early splits before
+normal buffering resumes. Small complete-frame tails target 320–768 bytes when
+credit and buffer capacity permit. All Waste, including 16–64-byte control
+suffixes, shares a session allowance of **2 KiB plus 2% of successfully written
+PSH payload**. Headers, Settings, heartbeats and padding do not earn credit.
+Credit is reserved before padding I/O; stream creation and repeated Settings
+cannot reset it. Short sessions may exceed 2%, and TLS/TCP overhead is additional.
+Budget exhaustion deliberately reduces shaping coverage.
+
+The implementation adds a bounded table of counters (limited by the session's
+stream limit), with no per-stream payload buffer, timer or delayed-send queue.
+Finished windows and locally closed streams release their table entries. Bulk
+traffic retains batching after its early window. Disable the experimental flag
+to restore the prior policy, or disable the main padding flag for unshaped output.
+This changes record lengths, not the causality of nested handshakes, and does
+not establish censorship resistance. Compare multiple blocking cycles on a
+canary before deployment. `cargo bench --bench download_throughput_bench` compares
+legacy and experimental policies over a fully parsed 16 MiB TLS download.
 
 Session-close debug logs report total shaping bytes and padding cost; measure
 latency, overhead, and IP survival on a canary before enabling it across a fleet.
